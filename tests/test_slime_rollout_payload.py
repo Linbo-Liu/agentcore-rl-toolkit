@@ -1,10 +1,8 @@
 """Tests for the slime backend's agent-payload conversion.
 
 ``_sample_to_payload`` is the contract between slime's ``Sample`` object
-and the agent's ``@rollout_entrypoint`` payload. Post the data-contract
-change, the rule is: the agent receives ``Sample.metadata`` verbatim
-(shallow-copied). These tests pin that rule so the contract can't
-regress silently.
+and the agent's ``@rollout_entrypoint`` payload. The rule: the agent
+receives ``Sample.metadata`` verbatim (shallow-copied).
 """
 
 from types import SimpleNamespace
@@ -13,37 +11,26 @@ from agentcore_rl_toolkit.backends.slime.integration.rollout import _sample_to_p
 
 
 def test_metadata_is_returned_verbatim():
-    sample = SimpleNamespace(metadata={"task_id": "t1", "prompt": "hi"})
-    assert _sample_to_payload(sample) == {"task_id": "t1", "prompt": "hi"}
+    """Core contract: the agent payload is Sample.metadata as-is.
 
-
-def test_empty_metadata_returns_empty_dict():
-    sample = SimpleNamespace(metadata={})
-    assert _sample_to_payload(sample) == {}
-
-
-def test_missing_metadata_attr_returns_empty_dict():
-    sample = SimpleNamespace()
-    assert _sample_to_payload(sample) == {}
-
-
-def test_none_metadata_returns_empty_dict():
-    sample = SimpleNamespace(metadata=None)
-    assert _sample_to_payload(sample) == {}
-
-
-def test_non_dict_metadata_returns_empty_dict():
-    sample = SimpleNamespace(metadata="not a dict")
-    assert _sample_to_payload(sample) == {}
+    Fields on Sample outside metadata (prompt, label) are slime's own
+    concern and must not leak into the payload.
+    """
+    sample = SimpleNamespace(
+        prompt="slime-side prompt",
+        label="slime-side label",
+        metadata={"task_id": "t1", "answer": "42"},
+    )
+    assert _sample_to_payload(sample) == {"task_id": "t1", "answer": "42"}
 
 
 def test_returned_dict_is_a_shallow_copy():
-    """Mutations to the returned payload must not leak into Sample.metadata.
+    """Mutations to the payload must not leak back into Sample.metadata.
 
-    _process_one_episode mutates ``Sample.metadata`` (e.g. injects
-    ``task_metadata``) downstream; the agent's view must remain stable.
+    ``_process_one_episode`` later injects keys into ``Sample.metadata``
+    (e.g. ``task_metadata``); the agent's view must stay stable.
     """
-    metadata = {"prompt": "hi", "answer": "42"}
+    metadata = {"prompt": "hi"}
     sample = SimpleNamespace(metadata=metadata)
 
     payload = _sample_to_payload(sample)
@@ -52,15 +39,11 @@ def test_returned_dict_is_a_shallow_copy():
     assert "injected" not in metadata
 
 
-def test_prompt_and_label_on_sample_are_ignored():
-    """Top-level sample.prompt / sample.label are no longer part of the payload.
-
-    They exist on ``Sample`` for slime's own use (tokenization, logging).
-    Post the data-contract change, only ``metadata`` reaches the agent.
-    """
-    sample = SimpleNamespace(
-        prompt="slime-side prompt",
-        label="slime-side label",
-        metadata={"foo": "bar"},
-    )
-    assert _sample_to_payload(sample) == {"foo": "bar"}
+def test_missing_or_invalid_metadata_returns_empty_dict():
+    """Defensive fallback when metadata is absent or not a dict."""
+    for sample in [
+        SimpleNamespace(),  # attribute absent
+        SimpleNamespace(metadata=None),  # explicit None
+        SimpleNamespace(metadata="not a dict"),  # wrong type
+    ]:
+        assert _sample_to_payload(sample) == {}
