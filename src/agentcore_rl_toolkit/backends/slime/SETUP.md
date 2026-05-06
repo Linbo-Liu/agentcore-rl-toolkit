@@ -149,21 +149,76 @@ cp .wandb.env.example .wandb.env     # optional; skip to disable wandb
 
 ### 3.4 Run training
 
-train.sh defaults target **8 × H100** (NUM_GPUS=8, TP_SIZE=2,
-ROLLOUT_GPUS_PER_ENGINE=2). For smaller clusters override via env
-(e.g. `NUM_GPUS=1 TP_SIZE=1 ROLLOUT_GPUS_PER_ENGINE=1` for a single
-GPU). Defaults also set `NUM_ROLLOUT=1` for smoke testing — bump to
-`NUM_ROLLOUT=100` (slime's production value) for a real run.
+Two entry points, same job under the hood:
 
-`SLIME_DIR` /
-`MEGATRON_DIR` need to point at the slime + Megatron-LM source trees
-(inside the `slimerl/slime:latest` container these are `/root/slime`
-and `/root/Megatron-LM`).
+- **`SlimeRunner` (Python)** — recommended. Write a short `train.py`;
+  the class handles Ray/SGLang plumbing and slime CLI flags.
+- **`train.sh` (bash)** — escape hatch. Use when you need to override
+  something the class doesn't surface, or to debug the raw slime CLI.
+
+#### Python (`SlimeRunner`)
+
+Defaults target **8 × H100** (`num_gpus=8`, `tp_size=2`,
+`rollout_gpus_per_engine=2`). Override kwargs for other cluster sizes.
+`.train(num_rollout=…)` defaults to 1 rollout for smoke testing — bump
+to 100 for a real run.
+
+`slime_dir` / `megatron_dir` default to the in-container paths
+(`/root/slime` and `/root/Megatron-LM`); override for bare-metal
+installs.
+
+```python
+# train.py — minimal 3B smoke test
+from agentcore_rl_toolkit.backends.slime import SlimeRunner
+
+SlimeRunner(
+    exp_id="gsm8k-3b-smoke",
+    agent_runtime_arn="arn:aws:bedrock-agentcore:...",
+    s3_bucket="your-bucket",
+    model_dir="/path/to/Qwen2.5-3B-Instruct",
+    data_path="/path/to/gsm8k_tiny.jsonl",
+    model_type="qwen2.5-3B",
+).train(num_rollout=1)
+```
 
 ```bash
 cd /path/to/agentcore-rl-toolkit
+python src/agentcore_rl_toolkit/backends/slime/examples/math_agent/train.py
+```
 
-# Qwen2.5-3B, 8 GPUs, 1 rollout (smoke test — train.sh defaults)
+32B on 8 GPUs:
+
+```python
+SlimeRunner(
+    exp_id="gsm8k-32b-run",
+    agent_runtime_arn="arn:aws:bedrock-agentcore:...",
+    s3_bucket="your-bucket",
+    model_dir="/path/to/Qwen2.5-32B-Instruct",
+    data_path="/path/to/gsm8k_tiny.jsonl",
+    model_type="qwen2.5-32B",
+    tp_size=8,
+    rollout_gpus_per_engine=8,
+).train(num_rollout=5)
+```
+
+Any slime/Megatron-LM/SGLang CLI flag that isn't surfaced as a named
+kwarg can be passed through `extra_flags`:
+
+```python
+SlimeRunner(..., extra_flags=["--num-epoch", "3"]).train(num_rollout=50)
+```
+
+If you prefer a YAML config, `SlimeRunner.from_yaml("config.yaml").train()`
+accepts the same keys.
+
+#### Bash (`train.sh`) — escape hatch
+
+`train.sh` takes the same knobs via env vars. It's kept as the low-level
+reference for what the Python class replicates, and as a debugging path
+for slime flag experiments.
+
+```bash
+# 3B smoke test
 export SLIME_DIR=/root/slime \
        MEGATRON_DIR=/root/Megatron-LM \
        MODEL_DIR=/path/to/Qwen2.5-3B-Instruct \
@@ -171,16 +226,7 @@ export SLIME_DIR=/root/slime \
 bash src/agentcore_rl_toolkit/backends/slime/examples/math_agent/train.sh
 ```
 
-For 32B on 8 GPUs:
-
-```bash
-export MODEL_DIR=/path/to/Qwen2.5-32B-Instruct \
-       MODEL_TYPE=qwen2.5-32B \
-       TP_SIZE=8 \
-       ROLLOUT_GPUS_PER_ENGINE=8 \
-       NUM_ROLLOUT=5
-bash src/agentcore_rl_toolkit/backends/slime/examples/math_agent/train.sh
-```
+For 32B on 8 GPUs, add `MODEL_TYPE=qwen2.5-32B TP_SIZE=8 ROLLOUT_GPUS_PER_ENGINE=8 NUM_ROLLOUT=5`.
 
 ### 3.5 Run evaluation
 
