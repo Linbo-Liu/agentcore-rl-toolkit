@@ -19,6 +19,7 @@ from reward import TauBenchReward
 from strands import Agent
 from strands.agent.conversation_manager import NullConversationManager
 from strands.models import BedrockModel
+from strands.models.openai import OpenAIModel
 from tau2.data_model.tasks import EnvFunctionCall
 from tau2.domains.airline.environment import get_environment as airline_env
 from tau2.domains.retail.environment import get_environment as retail_env
@@ -27,7 +28,6 @@ from tau2.user.user_simulator import get_global_user_sim_guidelines
 from utils import extract_text, log_turn, make_strands_tool, to_real_world_roles
 
 from agentcore_rl_toolkit import AgentCoreRLApp
-from agentcore_rl_toolkit.frameworks.strands.vllm_model import vLLMModel
 
 GET_ENVIRONMENT_FUNC = {
     "airline": airline_env,
@@ -94,7 +94,7 @@ def _setup_rollout(payload: dict) -> RolloutContext:
     domain = task["domain"]
 
     # Assistant model (RL-trained, served via vLLM)
-    assistant_model = vLLMModel(
+    assistant_model = OpenAIModel(
         client_args={"api_key": "EMPTY", "base_url": base_url},
         model_id=model_id,
         params=params,
@@ -266,31 +266,33 @@ def invoke_agent(payload: dict) -> dict:
     """Run one tau2-bench rollout and return its results.
 
     Sets up the rollout, drives the user/assistant conversation, computes the
-    reward, and returns rollout data, reward, conversation, and metadata. Used
-    as the ``@rollout_entrypoint``, which automatically runs this in the
-    background, saves the returned dict to S3, and records errors for the client.
+    reward, and returns the reward, conversation, and metadata. Used as the
+    ``@rollout_entrypoint``, which automatically runs this in the background,
+    saves the returned dict to S3, and records errors for the client.
+
+    Token IDs are captured server-side by the rllm-model-gateway HTTP proxy
+    (no client-side token collection in agent code).
 
     Args:
         payload: The rollout request (see ``_setup_rollout`` for the schema).
 
     Returns:
-        A JSON-serializable dict with keys: "rollout_data", "rewards",
-        "reward_info", "messages", and "meta". On assistant failure, a minimal
-        ``{"rollout_data", "rewards": 0.0}`` partial result.
+        A JSON-serializable dict with keys: "rewards", "reward_info",
+        "messages", and "meta". On assistant failure, a minimal
+        ``{"rewards": 0.0}`` partial result.
     """
     ctx = _setup_rollout(payload)
     logger.info("Starting rollout: domain=%s, model=%s", ctx.domain, ctx.model_id)
 
-    # Run conversation — if the rollout throws, return partial rollout with reward=0
+    # Run conversation — if the rollout throws, return reward=0
+    # (token IDs are captured server-side by the rllm-model-gateway, not collected here)
     try:
         global_messages, force_reward, terminated_reason = _run_conversation(ctx)
     except Exception:
         logger.exception("Rollout failed before completion")
-        rollout_data = ctx.assistant_model.get_token_data()
-        return {"rollout_data": rollout_data, "rewards": 0.0}
+        return {"rewards": 0.0}
 
     # Compute reward
-    rollout_data = ctx.assistant_model.get_token_data()
     if force_reward is not None:
         rewards = force_reward
         reward_info = {"forced": True, "terminated_reason": terminated_reason}
@@ -298,15 +300,13 @@ def invoke_agent(payload: dict) -> dict:
         reward_fn = TauBenchReward(GET_ENVIRONMENT_FUNC)
         rewards, reward_info = reward_fn(env=ctx.env, task=ctx.task, domain=ctx.domain, messages=global_messages)
     logger.info(
-        "Rollout complete: %d messages, %d steps, reward=%.4f, terminated_reason=%s",
+        "Rollout complete: %d messages, reward=%.4f, terminated_reason=%s",
         len(global_messages),
-        len(rollout_data),
         rewards,
         terminated_reason,
     )
 
     return {
-        "rollout_data": rollout_data,
         "rewards": rewards,
         "reward_info": reward_info,
         "messages": to_real_world_roles(global_messages),
