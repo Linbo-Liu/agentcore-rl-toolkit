@@ -68,14 +68,17 @@ Two separate packages are involved — don't confuse them:
 git clone https://github.com/awslabs/agentcore-rl-toolkit.git
 cd agentcore-rl-toolkit/examples/strands_taubench_agent
 
-# 2. Install the agentcore CLI (a separate AWS tool, used in the deploy steps below)
-pip install bedrock-agentcore-starter-toolkit
-
-# 3. Create the example's environment and install its dependencies
+# 2. Create and activate the example's environment
 uv venv --python 3.13
 source .venv/bin/activate
+
+# 3. Install dependencies into the venv:
+#    a) the example's own deps (pyproject.toml)
+#    b) agentcore-rl-toolkit from local source (so unreleased SDK changes are picked up)
+#    c) the agentcore CLI (separate AWS tool, used in the deploy steps below)
 uv pip install -e .
-uv pip install -e ../../ --force-reinstall --no-deps  # install agentcore-rl-toolkit from local source
+uv pip install -e ../../ --force-reinstall --no-deps
+uv pip install bedrock-agentcore-starter-toolkit
 ```
 
 > tau2-bench is **not** a pip dependency — it is not on PyPI and its data files
