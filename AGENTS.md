@@ -80,6 +80,7 @@ agentcore-rl-toolkit/
 │   │   ├── render.py               # Renderer protocol; HfTemplateRenderer, TinkerRenderer
 │   │   ├── parsing.py              # tool/reasoning output parsing (sglang optional)
 │   │   ├── gateway.py              # RolloutGateway — assembles the serving unit
+│   │   ├── server.py               # ThreadedGatewayServer — serve the gateway from sync trainers
 │   │   ├── adapters/               # OpenAI + Anthropic wire protocol adapters
 │   │   └── sampling_backends/      # SamplingBackend impls (vLLM/SGLang HTTP, Tinker SDK)
 │   └── backends/experimental/verl/ # Experimental verl backend on the rollout gateway
@@ -288,6 +289,7 @@ sample-only backends like Tinker, which cannot render themselves.
 | `SamplingBackend` | `sampling_backends/` | The one per-engine seam: `token_ids -> token_ids + logprobs` as a `TurnRecord`. Impls: `VllmHttpBackend`, `SglangHttpBackend`, `TinkerSdkBackend`. Placement rule: engine seams for independently reachable inference services (HTTP endpoints, hosted SDKs like Tinker) live here; seams over trainer-internal handles (e.g. `VerlSamplingBackend` over verl's Ray-based `LLMServerClient`) live with that trainer's integration under `backends/`. |
 | Adapters | `adapters/` | Wire-protocol translation: `OpenAIAdapter` (`/v1/chat/completions`), `AnthropicAdapter` (`/v1/messages`). An agent drives the gateway in its *native* protocol unmodified (just point `base_url` at it); both normalize to one canonical message form and share one `TrajectoryManager`. |
 | `RolloutGateway` | `gateway.py` | Assembles tokenizer + renderer + backend + adapters onto one aiohttp app sharing one `TrajectoryManager`. Session identity rides in the api-key / Bearer slot; `base_url` is a fixed gateway address (no per-session URLs). |
+| `ThreadedGatewayServer` | `server.py` | Serves an assembled gateway on a background thread with its own event loop — the deployment shape for synchronous trainers (slime, verl). Async trainers can mount `gateway.app` into their own loop instead. |
 
 **Session model.** A session id (in the Bearer slot) keys one trajectory tree.
 `gateway.create_session(sid)` → agent turns are captured → `gateway.finish_session(sid)`
@@ -383,6 +385,7 @@ upstream before re-syncing, diff the source file against the baseline commit bel
 | `rollout_gateway/trajectory.py` | `slime/agent/trajectory.py` | `90c212b5` |
 | `rollout_gateway/adapters/{common,openai,anthropic}.py` | `slime/agent/adapters/` | `90c212b5` |
 | `rollout_gateway/parsing.py` | `slime/agent/parsing.py` | `90c212b5` |
+| `rollout_gateway/server.py` | `slime/agent/aiohttp_threaded.py` | `fa3c990a` |
 
 Re-sync workflow: `git -C <slime> diff 90c212b5..HEAD -- slime/agent/<file>` shows upstream
 changes since the lift. Our copies are intentionally modified (torch-free; `Sample` →

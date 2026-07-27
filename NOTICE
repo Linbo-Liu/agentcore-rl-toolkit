@@ -13,3 +13,5 @@ slime, notably:
   - adapters/      — OpenAIAdapter, AnthropicAdapter, and the shared BaseAdapter
                      pipeline, adapted from slime/agent/adapters/.
   - parsing.py     — output-parsing helpers, adapted from slime/agent/parsing.py.
+  - server.py      — background-thread serving mechanics and FilteredAccessLogger,
+                     adapted from slime/agent/aiohttp_threaded.py.

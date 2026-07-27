@@ -212,3 +212,6 @@ select = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["agentcore_rl_toolkit"]
+
+[tool.pytest.ini_options]
+addopts = "--ignore=tests/rollout_gateway/integration_test"

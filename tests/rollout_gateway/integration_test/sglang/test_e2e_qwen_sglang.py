@@ -8,16 +8,22 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from contextlib import asynccontextmanager
+from contextlib import contextmanager
 
 import pytest
 
-from agentcore_rl_toolkit.rollout_gateway import BaseTrace, HfTemplateRenderer, RolloutGateway
+from agentcore_rl_toolkit.rollout_gateway import (
+    BaseTrace,
+    HfTemplateRenderer,
+    RolloutGateway,
+    ThreadedGatewayServer,
+)
 
 SGLANG_URL = os.environ.get("E2E_SGLANG_URL", "http://localhost:30000")
 MODEL = os.environ.get("E2E_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
 MAX_NEW_TOKENS = 512
 SERVER_LOG = "/tmp/e2e_sglang_server.log"
+GATEWAY_PORT = 9090
 
 HAVE_DEPS = all(importlib.util.find_spec(m) for m in ("openai", "sglang"))
 
@@ -105,19 +111,16 @@ def make_gateway():
     return gateway, backend, renderer, _TOKENIZER
 
 
-@asynccontextmanager
-async def serve(gateway: RolloutGateway):
-    from aiohttp import web
-
-    runner = web.AppRunner(gateway.app)
-    await runner.setup()
-    site = web.TCPSite(runner, "127.0.0.1", 0)
-    await site.start()
-    port = site._server.sockets[0].getsockname()[1]
+@contextmanager
+def serve(gateway: RolloutGateway):
+    """Serve the gateway exactly as a sync trainer would: on a
+    ThreadedGatewayServer, off the test's own event loop."""
+    gw_server = ThreadedGatewayServer(gateway, host="127.0.0.1", port=GATEWAY_PORT)
+    gw_server.start()
     try:
-        yield f"http://127.0.0.1:{port}"
+        yield f"http://127.0.0.1:{GATEWAY_PORT}"
     finally:
-        await runner.cleanup()
+        gw_server.shutdown()
 
 
 def _trained(rec) -> list[int]:
@@ -138,7 +141,7 @@ async def test_single_turn_token_exact(server):
     gateway.create_session(sid, sampling_defaults={"temperature": 0.0})
     messages = [{"role": "user", "content": "What is 2+2? Reply with just the number. /no_think"}]
 
-    async with serve(gateway) as base_url:
+    with serve(gateway) as base_url:
         import openai
 
         client = openai.AsyncOpenAI(base_url=f"{base_url}/v1", api_key=sid)
@@ -179,7 +182,7 @@ async def test_multi_turn_drift_healed_into_one_record(server):
     sid = "e2e:multi"
     gateway.create_session(sid, sampling_defaults={"temperature": 0.0})
 
-    async with serve(gateway) as base_url:
+    with serve(gateway) as base_url:
         import openai
 
         client = openai.AsyncOpenAI(base_url=f"{base_url}/v1", api_key=sid)
@@ -232,7 +235,7 @@ async def test_rewritten_echo_trains_only_final_turn(server):
     sid = "e2e:rewrite"
     gateway.create_session(sid, sampling_defaults={"temperature": 0.0})
 
-    async with serve(gateway) as base_url:
+    with serve(gateway) as base_url:
         import openai
 
         client = openai.AsyncOpenAI(base_url=f"{base_url}/v1", api_key=sid)
@@ -278,7 +281,7 @@ async def test_stateless_turns_fork_into_separate_records(server):
         "What is 3*3? Reply with just the number. /no_think",
     ]
 
-    async with serve(gateway) as base_url:
+    with serve(gateway) as base_url:
         import openai
 
         client = openai.AsyncOpenAI(base_url=f"{base_url}/v1", api_key=sid)

@@ -15,6 +15,10 @@ build/
 .env
 .wandb.env
 
+# Logs and experiment tracking
+wandb/
+*.log
+
 # Local slime backend config (contains ARN/bucket; commit config.yaml.example only)
 src/agentcore_rl_toolkit/backends/slime/examples/**/config.yaml
 
