@@ -39,6 +39,8 @@ dev = [
     # aiohttp for adapter/server tests, transformers for renderer round-trip / E2E.
     "aiohttp>=3.9",
     "transformers>=4.44",
+    # openai: real-SDK wire-contract test for the gateway (Bearer-slot session capture).
+    "openai>=1.0",
 ]
 gateway = [
     # The rollout capture gateway (agentcore_rl_toolkit.rollout_gateway). Trainer-side
@@ -91,17 +93,69 @@ verl = [
     "qwen-vl-utils",
     "rllm-model-gateway>=0.1.0",
 ]
+verl-experimental = [
+    # For backends/experimental/verl — see its README for the design and install
+    # notes. verl is pinned via [tool.uv.sources] below.
+    "verl",
+    # verl declares runtime deps in requirements.txt (its Docker images pip-install
+    # it), not in setup.py install_requires — so a git install of verl misses them.
+    # Declared here as proven needed (import-time failures on our training path):
+    "transferqueue==0.1.8",  # v1 trainer data plane (main_ppo.py)
+    "orjson",  # verl.utils.tracking (undeclared even in verl's requirements.txt)
+    "aiohttp>=3.9",
+    "transformers>=4.44",
+    "numpy",
+    "ray",
+    "torch>=2.10.0",
+    "torchvision>=0.23.0",
+    # matches verl's reference stack at the pinned commit
+    # (docker/Dockerfile.stable.vllm: vllm 0.23.0 / torch 2.11.0 / cu130 / flash-attn 2.8.3)
+    "vllm==0.23.0",
+    "flash-linear-attention",
+    "flash-attn==2.8.3",
+    "qwen-vl-utils",
+]
+verl-experimental-ci = [
+    # CI slice of [verl-experimental] for the experimental-verl-integration
+    # workflow: same pinned verl (the [tool.uv.sources] entry applies) and
+    # declared runtime deps, but CPU torch (index steering below) and no
+    # inference engines (vllm / flash-attn / qwen-vl-utils) — the backend's
+    # integration tests fake the LLM-server seam, and none of those install on
+    # a GitHub runner (CUDA wheels, source builds).
+    "verl",
+    "transferqueue==0.1.8",
+    "orjson",
+    # verl deps the full extra gets transitively via vllm: fastapi/uvicorn are
+    # in verl's requirements.txt (not its setup.py); cachetools is undeclared
+    # even there (verl/workers/rollout/llm_server.py).
+    "cachetools",
+    "fastapi",
+    "uvicorn",
+    "aiohttp>=3.9",
+    "transformers>=4.44",
+    "numpy",
+    "ray",
+    "torch>=2.10.0",
+    "torchvision>=0.23.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/awslabs/agentcore-rl-toolkit"
 
 [tool.uv]
+# flash-attn's setup.py imports torch at build time and must see the SAME torch
+# it will run against; uv's isolated build env broke this (CUDA version probing
+# fails/mismatches). Build it in the venv instead — torch resolves first, flash-attn
+# builds last. CUDA toolkit requirements: see backends/experimental/verl/README.md.
+no-build-isolation-package = ["flash-attn"]
 # Declaring verl and rllm as conflicting extras lets uv resolve each
 # in its own fork instead of forcing one universal lock.
 conflicts = [
     [
         { extra = "verl" },
         { extra = "rllm" },
+        { extra = "verl-experimental" },
+        { extra = "verl-experimental-ci" },
     ],
 ]
 override-dependencies = [
@@ -115,11 +169,28 @@ override-dependencies = [
 # dependencies, which PyPI rejects. uv reads this source when installing the
 # [rllm] extra from a checkout of this repo.
 rllm = { git = "https://github.com/rllm-org/rllm.git" }
-
-[tool.uv.extra-build-dependencies]
-flash-attn = [
-    { requirement = "torch", match-runtime = true },
+# verl pinned to uni-agent's blessed submodule commit for the experimental
+# backend (backends/experimental/verl). Applies only when the
+# [verl-experimental] extra is selected; the legacy [verl] extra resolves
+# verl==0.8.0 from PyPI in its own conflict fork.
+verl = [
+    { git = "https://github.com/volcengine/verl.git", rev = "78bba31d1a6b95084d83f8bddd59c190ca704144", extra = "verl-experimental" },
+    { git = "https://github.com/volcengine/verl.git", rev = "78bba31d1a6b95084d83f8bddd59c190ca704144", extra = "verl-experimental-ci" },
 ]
+# CI fork only: CPU torch wheels so the CUDA distribution (plus nvidia-* wheels)
+# never resolves on GitHub runners. The other extras keep the default index.
+torch = [
+    { index = "pytorch-cpu", extra = "verl-experimental-ci" },
+]
+torchvision = [
+    { index = "pytorch-cpu", extra = "verl-experimental-ci" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
 
 [tool.hatch.metadata]
 # Required so the [rllm] optional extra can pin rllm via a git URL
