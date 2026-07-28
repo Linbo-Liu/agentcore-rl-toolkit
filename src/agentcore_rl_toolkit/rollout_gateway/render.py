@@ -9,8 +9,12 @@ inference backends (e.g. Tinker) that cannot render themselves.
 Two implementations behind one :class:`Renderer` protocol:
 
 * :class:`HfTemplateRenderer` (default, lightweight) — renders with the HF tokenizer's
-  ``apply_chat_template`` and parses output via ``parse_model_output`` (dependency-free
-  regex + ``</think>`` split). Needs only ``transformers``.
+  ``apply_chat_template`` and derenders by applying a reasoning parser then a tool
+  parser in sequence, each independently overridable via ``reasoning_parser`` /
+  ``tool_parser`` and each falling back to the dependency-free default (``</think>``
+  split / ``<tool_call><function=...>`` regex). Needs only ``transformers``; the
+  override seams are how engine-grade parsers (e.g. SGLang's detectors) plug in
+  without this package depending on any engine — the slime backend supplies them.
 * :class:`TinkerRenderer` — wraps a tinker-cookbook ``Renderer`` (install ``tinker``
   and ``tinker-cookbook`` manually; they require Python >=3.11). Its ``tinker_cookbook``
   import (which pulls torch) is deferred into ``__init__``, so importing this module
@@ -18,9 +22,16 @@ Two implementations behind one :class:`Renderer` protocol:
 """
 
 import dataclasses
+from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
-from .parsing import ParsedModelOutput, parse_model_output
+from .parsing import parse_tool_uses, split_reasoning
+
+# The two derender stages, as injectable callables:
+#   ReasoningParser: raw_output -> (reasoning, body_text)
+#   ToolParser     : (body_text, tools_schema) -> (text, tool_uses, ill_formed)
+ReasoningParserFn = Callable[[str], tuple[str, str]]
+ToolParserFn = Callable[[str, list[dict]], tuple[str, list[dict[str, Any]], bool]]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -34,10 +45,6 @@ class ParsedOutput:
     text: str
     tool_uses: list[dict[str, Any]]
     ill_formed: bool = False
-
-
-def _to_parsed_output(p: ParsedModelOutput) -> ParsedOutput:
-    return ParsedOutput(reasoning=p.reasoning, text=p.text, tool_uses=p.tool_uses, ill_formed=p.ill_formed)
 
 
 @runtime_checkable
@@ -71,13 +78,24 @@ class Renderer(Protocol):
 
 
 class HfTemplateRenderer:
-    """Default renderer: HF ``apply_chat_template`` for rendering, ``parse_model_output``
-    for derendering.
+    """Default renderer: HF ``apply_chat_template`` for rendering, a reasoning stage then
+    a tool stage for derendering.
 
-    Depends only on a HF tokenizer (``transformers``). Tool calls are parsed with a
-    dependency-free regex (the common ``<tool_call>`` format) and reasoning via a
-    ``</think>`` split — no inference-engine dependency. A model whose output needs
-    engine-grade parsing is handled by a different ``Renderer`` implementation, not here.
+    Depends only on a HF tokenizer (``transformers``). Derendering runs two stages in
+    sequence — reasoning first, then tool calls on what remains (the same order the
+    inference engines use) — each independently overridable and each defaulting to the
+    dependency-free implementation in ``parsing``:
+
+    * ``reasoning_parser``: ``raw_output -> (reasoning, body_text)``.
+      Default: split on ``</think>``.
+    * ``tool_parser``: ``(body_text, tools_schema) -> (text, tool_uses, ill_formed)``,
+      called only when the request carries a tools schema.
+      Default: the ``<tool_call><function=...>`` regex.
+
+    Overriding one leaves the other on its default, so a model whose tool format needs
+    engine-grade parsing but whose reasoning is a plain ``</think>`` block needs only
+    ``tool_parser``. These seams are how engine parsers plug in (see
+    ``backends.slime.integration.sglang_parsing``) without this package importing an engine.
     """
 
     def __init__(
@@ -85,9 +103,13 @@ class HfTemplateRenderer:
         tokenizer,
         *,
         stop_sequences: list[str] | list[int] | None = None,
+        reasoning_parser: ReasoningParserFn | None = None,
+        tool_parser: ToolParserFn | None = None,
     ) -> None:
         self.tokenizer = tokenizer
         self._stop_sequences: list = list(stop_sequences) if stop_sequences else []
+        self.reasoning_parser: ReasoningParserFn = reasoning_parser or split_reasoning
+        self.tool_parser: ToolParserFn = tool_parser or parse_tool_uses
 
     def render(
         self,
@@ -117,8 +139,17 @@ class HfTemplateRenderer:
         tools_schema: list[dict] | None = None,
     ) -> ParsedOutput:
         raw_output = self.tokenizer.decode(output_ids, skip_special_tokens=False) if output_ids else ""
-        parsed = parse_model_output(raw_output, tools_schema=tools_schema)
-        return _to_parsed_output(parsed)
+        reasoning, body_text = self.reasoning_parser(raw_output)
+        tool_uses: list[dict[str, Any]] = []
+        ill_formed = False
+        if tools_schema:
+            body_text, tool_uses, ill_formed = self.tool_parser(body_text, tools_schema)
+        return ParsedOutput(
+            reasoning=(reasoning or "").strip(),
+            text=(body_text or "").strip(),
+            tool_uses=tool_uses,
+            ill_formed=ill_formed,
+        )
 
 
 class TinkerRenderer:

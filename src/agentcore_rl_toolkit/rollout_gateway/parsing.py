@@ -25,16 +25,35 @@ class ParsedModelOutput:
     ill_formed: bool = False
 
 
+def split_reasoning(raw_output: str) -> tuple[str, str]:
+    """Default reasoning stage: split ``(reasoning, body)`` on a ``</think>`` marker.
+
+    Text with no marker is all body. This is the fallback for the renderer's
+    ``reasoning_parser`` seam.
+    """
+    if "</think>" not in raw_output:
+        return "", raw_output
+    reasoning, body_text = raw_output.split("</think>", 1)
+    return reasoning.removeprefix("<think>"), body_text
+
+
+def parse_tool_uses(body_text: str, tools_schema: list[dict]) -> tuple[str, list[dict[str, Any]], bool]:
+    """Default tool stage: ``(text, tool_uses, ill_formed)`` from the XML ``<tool_call>`` format.
+
+    Signature matches the renderer's ``tool_parser`` seam; the regex never reports
+    ``ill_formed`` (unmatched text is simply left as visible text).
+    """
+    text, tool_uses = parse_xml_tool_uses(body_text, tools_schema)
+    return text, tool_uses, False
+
+
 def parse_model_output(
     raw_output: str,
     *,
     tools_schema: list[dict] | None,
 ) -> ParsedModelOutput:
     """Parse raw model text into reasoning, visible text, and tool uses."""
-    reasoning, body_text = "", raw_output
-    if "</think>" in body_text:
-        reasoning, body_text = body_text.split("</think>", 1)
-        reasoning = reasoning.removeprefix("<think>")
+    reasoning, body_text = split_reasoning(raw_output)
 
     tool_uses: list[dict[str, Any]] = []
     if tools_schema:
@@ -72,4 +91,10 @@ def parse_xml_tool_uses(body_text: str, tools_schema: list[dict]) -> tuple[str, 
     return "".join(cleaned_parts), tool_uses
 
 
-__all__ = ["ParsedModelOutput", "parse_model_output", "parse_xml_tool_uses"]
+__all__ = [
+    "ParsedModelOutput",
+    "parse_model_output",
+    "parse_tool_uses",
+    "parse_xml_tool_uses",
+    "split_reasoning",
+]
