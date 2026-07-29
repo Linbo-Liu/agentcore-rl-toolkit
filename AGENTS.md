@@ -316,9 +316,15 @@ drains the tree into `list[TraceRecord]`.
 **Dependencies.** The gateway is trainer-side and lives behind extras — the base install
 (agent-side `AgentCoreRLApp` / `RolloutClient`) stays lean:
 - `pip install agentcore-rl-toolkit[gateway]` → `aiohttp` + `transformers`.
-- Tool/reasoning parsing uses a dependency-free regex (common `<tool_call>` format) and
-  `</think>` split; no engine parser dependency. A caller needing engine-grade parsing
-  for an exotic format installs `sglang`/`vllm` and passes a parser name explicitly.
+- Tool/reasoning parsing defaults to a dependency-free regex (the `<tool_call><function=...>`
+  XML format) and `</think>` split; the gateway itself never imports an inference engine.
+  For any other model format (e.g. Qwen3's JSON `<tool_call>`), inject an `output_parser`
+  callable (`(raw_output, tools_schema) -> ParsedOutput`) into `HfTemplateRenderer` — it
+  replaces the built-in derender entirely. The slime backend ships such a parser built from
+  SGLang's own detectors (`backends/slime/integration/sglang_parsing.py`, composing
+  `FunctionCallParser` + `ReasoningParser`) and wires it automatically from slime's
+  `--sglang-tool-call-parser` / `--sglang-reasoning-parser` args (names must match the
+  served model); sglang is always importable there because the trainer serves SGLang.
 - For the Tinker backend (`TinkerSdkBackend` + `TinkerRenderer`), install `tinker` and
   `tinker-cookbook` manually — they require Python ≥3.11, so they are not declared as an
   extra (this package supports ≥3.10). Both pull torch.

@@ -80,3 +80,80 @@ def test_parse_extracts_reasoning_from_think_block():
     out = r.parse([1], tools_schema=None)
     assert out.reasoning == "weighing options"
     assert out.text == "the answer is 4"
+
+
+# ---------------------------------------------------------------------------
+# reasoning_parser / tool_parser: the two injectable derender stages
+# ---------------------------------------------------------------------------
+# Each override leaves the other stage on its dependency-free default, and the
+# stages run in sequence: reasoning first, tool calls on what remains.
+
+TOOLS = [{"type": "function", "function": {"name": "x", "parameters": {}}}]
+
+
+class ThinkTok(StubTokenizer):
+    def decode(self, ids, skip_special_tokens=False):
+        return "<think>hmm</think>body"
+
+
+def test_stages_run_in_sequence_reasoning_then_tools():
+    seen = {}
+
+    def reasoning_parser(raw_output):
+        seen["raw"] = raw_output
+        return "R", "BODY"
+
+    def tool_parser(body_text, tools_schema):
+        seen["body"] = body_text
+        seen["tools"] = tools_schema
+        return "T", [{"name": "x", "input": {}}], True
+
+    r = HfTemplateRenderer(ThinkTok(), reasoning_parser=reasoning_parser, tool_parser=tool_parser)
+    out = r.parse([1], tools_schema=TOOLS)
+
+    assert seen["raw"] == "<think>hmm</think>body"  # reasoning stage sees raw text
+    assert seen["body"] == "BODY"  # tool stage sees the reasoning stage's remainder
+    assert seen["tools"] == TOOLS
+    assert out == ParsedOutput(reasoning="R", text="T", tool_uses=[{"name": "x", "input": {}}], ill_formed=True)
+
+
+def test_tool_parser_override_keeps_default_reasoning_split():
+    """The common case: engine-grade tool parsing, </think> reasoning left to the default."""
+
+    def tool_parser(body_text, tools_schema):
+        return "", [{"name": "x", "input": {"got": body_text}}], False
+
+    r = HfTemplateRenderer(ThinkTok(), tool_parser=tool_parser)
+    out = r.parse([1], tools_schema=TOOLS)
+    assert out.reasoning == "hmm"
+    assert out.tool_uses == [{"name": "x", "input": {"got": "body"}}]
+
+
+def test_reasoning_parser_override_keeps_default_tool_regex():
+    class XmlTok(StubTokenizer):
+        def decode(self, ids, skip_special_tokens=False):
+            return "REASON||<tool_call><function=x><parameter=q>v</parameter></function></tool_call>"
+
+    r = HfTemplateRenderer(XmlTok(), reasoning_parser=lambda raw: tuple(raw.split("||", 1)))
+    out = r.parse([1], tools_schema=TOOLS)
+    assert out.reasoning == "REASON"
+    assert out.tool_uses == [{"name": "x", "input": {"q": "v"}}]
+
+
+def test_tool_parser_skipped_without_tools_schema():
+    calls = []
+
+    def tool_parser(body_text, tools_schema):
+        calls.append(body_text)
+        return "", [], False
+
+    r = HfTemplateRenderer(ThinkTok(), tool_parser=tool_parser)
+    out = r.parse([1], tools_schema=None)
+    assert calls == []  # no tools -> tool stage never runs
+    assert out.reasoning == "hmm"
+    assert out.text == "body"
+
+
+def test_tool_parser_ill_formed_propagates():
+    r = HfTemplateRenderer(ThinkTok(), tool_parser=lambda body, tools: (body, [], True))
+    assert r.parse([1], tools_schema=TOOLS).ill_formed is True
