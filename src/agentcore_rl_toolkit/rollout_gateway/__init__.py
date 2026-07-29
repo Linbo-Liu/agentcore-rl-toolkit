@@ -10,9 +10,9 @@ Import layering:
   imports with nothing beyond the stdlib — torch-free and aiohttp-free.
   (``HfTemplateRenderer`` needs a HF tokenizer only when *used*, not to import; sglang
   parsers and tinker are lazy/optional.)
-- ``RolloutGateway`` and the HTTP adapters require ``aiohttp`` (the ``[gateway]`` extra),
-  so ``RolloutGateway`` is exposed lazily via ``__getattr__`` — importing this package
-  never requires aiohttp.
+- ``RolloutGateway``, ``ThreadedGatewayServer``, and the HTTP adapters require
+  ``aiohttp`` (the ``[gateway]`` extra), so both are exposed lazily via
+  ``__getattr__`` — importing this package never requires aiohttp.
 """
 
 from .render import HfTemplateRenderer, ParsedOutput, Renderer
@@ -32,6 +32,7 @@ __all__ = [
     "RolloutGateway",
     "SamplingBackend",
     "Status",
+    "ThreadedGatewayServer",
     "TraceRecord",
     "TrajectoryManager",
     "TurnRecord",
@@ -39,9 +40,13 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    # RolloutGateway pulls in the aiohttp adapters; keep it off the plain import path.
+    # These pull in aiohttp; keep them off the plain import path.
     if name == "RolloutGateway":
         from .gateway import RolloutGateway
 
         return RolloutGateway
+    if name == "ThreadedGatewayServer":
+        from .server import ThreadedGatewayServer
+
+        return ThreadedGatewayServer
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

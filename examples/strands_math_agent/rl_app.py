@@ -40,6 +40,9 @@ def invoke_agent(payload: dict, context):
     base_url = payload["_rollout"]["base_url"]
     model_id = payload["_rollout"]["model_id"]
     params = payload["_rollout"].get("sampling_params", {})
+    # During training the rollout gateway keys the session off the api-key slot;
+    # "EMPTY" (the vLLM convention) is fine for plain evaluation endpoints.
+    api_key = payload["_rollout"].get("api_key", "EMPTY")
 
     # The ACR session id doubles as the trajectory-capture session key: rollout
     # gateways read it from the api-key slot. "EMPTY" for local runs and
@@ -65,8 +68,13 @@ def invoke_agent(payload: dict, context):
 
     response = agent(user_input)
 
-    # Compute rewards
-    rewards = reward_fn(response_text=response.message["content"][0]["text"], ground_truth=answer)
+    # Compute rewards. Join the text blocks instead of indexing content[0]: a
+    # reasoning-parsing server (vllm/sglang --reasoning-parser, or the rollout
+    # gateway) returns reasoning_content, which Strands surfaces as a leading
+    # reasoningContent block before the text block.
+    content = response.message.get("content") or []
+    response_text = "".join(block["text"] for block in content if "text" in block)
+    rewards = reward_fn(response_text=response_text, ground_truth=answer)
 
     return {"rewards": rewards}
 
