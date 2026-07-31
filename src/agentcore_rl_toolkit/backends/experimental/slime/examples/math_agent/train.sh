@@ -99,9 +99,6 @@ ray start --head --num-gpus ${NUM_GPUS} --disable-usage-stats
 # Source model architecture args (populates MODEL_ARGS)
 source ${SLIME_DIR}/scripts/models/${MODEL_TYPE}.sh
 
-# === Launch training ===
-export no_proxy=127.0.0.1
-
 # Env forwarded to every Ray worker (ACR ARN + bucket come from config.yaml instead).
 # WANDB_API_KEY is appended only when set, to avoid injecting an empty value.
 RUNTIME_ENV_JSON="{\"env_vars\": {\"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\", \"CUDA_HOME\": \"${CUDA_HOME}\", \"CUDNN_HOME\": \"${CUDNN_HOME}\", \"CUDNN_PATH\": \"${CUDNN_PATH}\", \"CUDNN_FRONTEND_CUDART_LIB_NAME\": \"${CUDNN_FRONTEND_CUDART_LIB_NAME}\", \"LD_LIBRARY_PATH\": \"${LD_LIBRARY_PATH}\"${WANDB_API_KEY:+, \"WANDB_API_KEY\": \"${WANDB_API_KEY}\"}}}"
@@ -149,7 +146,6 @@ ray job submit --address="http://127.0.0.1:8265" \
   --sequence-parallel \
   --sglang-mem-fraction-static 0.6 \
   --sglang-cuda-graph-max-bs 32 \
-  --sglang-tool-call-parser qwen \
   --sglang-log-level warning \
   --sglang-log-level-http warning \
   --accumulate-allreduce-grads-in-fp32 \
@@ -159,8 +155,8 @@ ray job submit --address="http://127.0.0.1:8265" \
   --colocate \
   --train-env-vars "${TRAIN_ENV_VARS_JSON}" \
   --megatron-to-hf-mode bridge \
-  --rollout-function-path \
-      agentcore_rl_toolkit.backends.experimental.slime.integration.rollout.generate_rollout \
+  --custom-generate-function-path \
+      agentcore_rl_toolkit.backends.experimental.slime.integration.rollout.generate \
   --custom-reward-post-process-path \
       agentcore_rl_toolkit.backends.experimental.slime.integration.rewards.normalize_episode_rewards \
   --custom-config-path ${CONFIG} \

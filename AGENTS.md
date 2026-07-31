@@ -96,9 +96,8 @@ agentcore-rl-toolkit/
 │       └── slime/                  # Experimental slime backend on the rollout gateway
 │           ├── SETUP.md            # env install + train/eval walkthrough, tested versions
 │           ├── integration/
-│           │   ├── rollout.py      # generate_rollout (slime --rollout-function-path)
-│           │   ├── rewards.py      # normalize_episode_rewards (episode-level GRPO)
-│           │   └── sglang_parsing.py # derender seams built from SGLang's own detectors
+│           │   ├── rollout.py      # generate (slime --custom-generate-function-path)
+│           │   └── rewards.py      # normalize_episode_rewards (episode-level GRPO)
 │           ├── scripts/install_slime.sh  # bare-metal slime install (CUDA 13)
 │           └── examples/math_agent/      # GSM8K example: train.sh + config templates
 ├── examples/
@@ -327,24 +326,13 @@ drains the tree into `list[TraceRecord]`.
 
 **Dependencies.** The gateway is trainer-side and lives behind extras — the base install
 (agent-side `AgentCoreRLApp` / `RolloutClient`) stays lean:
-- `pip install agentcore-rl-toolkit[gateway]` → `aiohttp` + `transformers` + `jmespath`.
-- Tool/reasoning parsing: when the tokenizer's chat template is recognized (sha256 hash
-  lookup in `rollout_gateway/response_schemas.py`), `HfTemplateRenderer` derenders the
-  whole output in one pass via `tokenizer.parse_response(text, schema=...)` — reasoning,
-  text, and tool calls in the model family's actual format (Qwen2.5/3/3.5/3.6,
-  GLM4-MoE, GPT-OSS, Nemotron-3; schemas vendored from huggingface/trl, see NOTICE). A
-  parse failure degrades to raw text with `ill_formed=True`, never an exception.
-  Unrecognized templates fall back to a `</think>` split for tool-free parsing, but
-  tool-bearing requests are **rejected** (there is no implicit tool parser — the
-  dependency-free `<tool_call><function=...>` XML regex understands one format and
-  would silently miss every other; opt into it explicitly with
-  `tool_parser=parse_tool_uses`); the gateway itself never imports an inference
-  engine. Injecting a `reasoning_parser` / `tool_parser` callable into
-  `HfTemplateRenderer` disables schema detection and takes full control. The slime backend injects parsers built from
-  SGLang's own detectors (`backends/slime/integration/sglang_parsing.py`, composing
-  `FunctionCallParser` + `ReasoningParser`) wired from slime's
-  `--sglang-tool-call-parser` / `--sglang-reasoning-parser` args (names must match the
-  served model); sglang is always importable there because the trainer serves SGLang.
+- `pip install agentcore-rl-toolkit[gateway]` → `aiohttp` + `transformers`.
+- Tool/reasoning parsing: the gateway auto-detects the model's output format from the
+  chat template hash (qwen3, qwen3_5, glm4moe, gptoss families covered) and derenders
+  via `tokenizer.parse_response` in one pass. For unrecognized templates, inject custom
+  `tool_parser` / `reasoning_parser` callables into `HfTemplateRenderer` — each
+  independently overridable, defaulting to a dependency-free `</think>` split and
+  `<tool_call><function=...>` XML regex.
 - For the Tinker backend (`TinkerSdkBackend` + `TinkerRenderer`), install `tinker` and
   `tinker-cookbook` manually — they require Python ≥3.11, so they are not declared as an
   extra (this package supports ≥3.10). Both pull torch.
@@ -396,21 +384,55 @@ Key pieces (see `backends/experimental/verl/README.md` for the full design):
   (`reward_mode="separate"`) is rejected at startup: verl's reward managers require
   `data_source`/`reward_model.ground_truth` columns the payload-first dataset contract
   doesn't provide.
-- Agent-side contract: the app sets `api_key = payload["_rollout"].get("api_key") or
-  "EMPTY"` — the loop supplies the capture session key in the payload (it also equals
-  the ACR `runtimeSessionId`, so older images reading `context.session_id` still work)
-  and the gateway keys capture off the Bearer/api-key slot (`"EMPTY"` keeps local runs
-  and the legacy per-session-URL gateways working). Adopted by `strands_math_agent`
-  (validated end to end); the other examples still send `"EMPTY"` and migrate as
-  they're validated against this backend.
+- Agent-side contract: the app sets `api_key = context.session_id or "EMPTY"` so the
+  gateway can key capture off the Bearer/api-key slot (`"EMPTY"` keeps local runs and
+  the legacy per-session-URL gateways working). `strands_math_agent` does this and is
+  validated end to end; the other examples read the key from `_rollout["api_key"]`
+  instead (see the slime backend below) — equivalent for capture, since both backends
+  use the ACR session id as the gateway session id.
 - Validated end to end: `examples/math_agent/fsdp_fft_sync_grpo.sh` (GRPO, Qwen3-4B
   full-FT, TIS + KL trust region) reaches ~0.93 GSM8K val reward in one epoch against
   a live ACR agent.
 
-**Vendored from upstream projects (baselines).** Several files are adapted from
-[slime](https://github.com/THUDM/slime) and [trl](https://github.com/huggingface/trl)
-(both Apache-2.0; see `NOTICE`). To check what changed upstream before re-syncing, diff
-the source against the baseline commit below:
+### Experimental slime backend (`backends/experimental/slime/`)
+
+The successor to `backends/slime` (which stays untouched — it still depends on the external
+`rllm-model-gateway` — until this graduates). It plugs into **stock** `slime/train.py`
+through slime's public extension points only (`--custom-generate-function-path`,
+`--custom-reward-post-process-path`, `--custom-config-path`): no forked trainer, no custom
+entrypoint. Setup, config reference, and the validated version pins live in
+`backends/experimental/slime/SETUP.md`.
+
+Key pieces:
+- `integration/rollout.py` — `generate`, slime's per-sample `--custom-generate-function-path`
+  hook. `AgentCoreService` (singleton) assembles the gateway and ACR client once; per sample:
+  create a gateway session (sid = `sample.session_id`, assigned by slime), invoke ACR via
+  `RolloutClient.invoke_async`, await the S3 result, drain the session into `TraceRecord`s,
+  and convert each record to a slime `Sample`. Slime owns the batch loop, concurrency,
+  eval datasets, and event loop — this module is just one sample's logic. Failures return an
+  ABORTED sample (`remove_sample=True`, `loss_mask=[0]`) rather than raising.
+- `integration/rewards.py` — `normalize_episode_rewards`, replacing slime's default
+  reshape-based normalization (which assumes a fixed row count per rollout). Groups by
+  `(group_index, rollout_id)` so a forked trajectory still counts as one data point per
+  rollout for GRPO baseline computation.
+- Config: ACR pointers and tunables come from a `--custom-config-path` YAML that slime merges
+  into its args namespace (`AgentCoreConfig.from_args`). `examples/math_agent/config.yaml.example`
+  is the template (`config.yaml` itself is gitignored).
+- **Networking constraint:** the gateway binds to the host's LAN IP (via slime's `get_host_info`),
+  not loopback, because ACR-deployed agents dial back on every LLM call. Override with
+  `gateway_host` in the config YAML if the auto-detected IP is wrong.
+- Validated end to end: `examples/math_agent/train.sh` (GSM8K GRPO, Qwen3, colocated
+  train+rollout on 8×B200) against a live ACR deployment of `strands_math_agent`.
+- **CUDA 13 only.** `scripts/install_slime.sh` plus the env-pinning preamble in `train.sh`
+  work around several cu12/cu13 collisions (TE's vendored cuDNN Frontend probing for
+  `libcudart.so.12`, cuDNN main/sublib version mismatch, slime's hardcoded cu12
+  `torch_memory_saver` `.so`, and slime dropping the pinned paths from Megatron actors'
+  `runtime_env`). Each workaround is commented inline where it lives — read those before
+  touching the library paths.
+
+**Vendored from slime (upstream baselines).** Several files are adapted from
+[slime](https://github.com/THUDM/slime) (Apache-2.0; see `NOTICE`). To check what changed
+upstream before re-syncing, diff the source file against the baseline commit below:
 
 | This repo | upstream source | Baseline commit |
 |---|---|---|
@@ -508,7 +530,7 @@ See `examples/strands_math_agent` for a complete example adapting from `basic_ap
 - Model config (`base_url`, `model_id`) comes from the `_rollout` payload, not environment variables
 - Optional `sampling_params` (e.g., `max_completion_tokens`, `temperature`) can also be passed via `_rollout` for training-engine-controlled generation settings
 - Use standard `OpenAIModel` — no custom model wrappers needed. For evaluation, `base_url` can point directly to any OpenAI-compatible endpoint (vLLM, SGLang, LiteLLM, etc.), or you can use `BedrockModel` directly
-- `api_key` is set from `payload["_rollout"].get("api_key")` — the training engine passes the trajectory-capture session key in the `_rollout` config (gateways like the experimental verl backend key token capture off the api-key slot). Fall back to `"EMPTY"` (the standard vLLM convention for unauthenticated servers) for local runs, evaluation endpoints, and gateways with per-session URLs, which ignore the api key
+- `api_key` carries the trajectory-capture session key: gateways key token capture off the api-key / Bearer slot. Two equivalent sources — `context.session_id` (the ACR runtime session id, available when the entrypoint declares a second `context` parameter), which the experimental verl backend uses since it sets the ACR session id itself, or `payload["_rollout"]["api_key"]`, which the experimental slime backend passes explicitly. Fall back to `"EMPTY"` (the standard vLLM convention for unauthenticated servers) for local runs and gateways with per-session URLs, which ignore the api key
 - Model and agent are created per-invocation inside the entrypoint
 - This gives flexibility for the training engine to pass runtime configuration (inference address, sampling parameters, system prompt, etc.) to accommodate different learning scenarios
 - This is safe because RL rollouts are single-invocation — the agent doesn't need persistent conversation history across requests, so there's no need to keep model/agent as global state
@@ -679,12 +701,12 @@ they run in `.github/workflows/experimental-verl-integration.yml`, which syncs t
 `verl-experimental-ci` extra (same pinned verl, but CPU torch and no vllm/flash-attn —
 the LLM server client is the faked seam, so no inference engine is needed).
 
-The experimental slime backend has no automated tests yet — its seams (`Sample`,
-`RolloutFnTrainOutput`, Megatron shapes) are only meaningful against an installed slime,
-which the bare-metal CUDA 13 install makes impractical in CI. Verify changes with an
-end-to-end run per `backends/experimental/slime/SETUP.md`. The pure functions
-(`_record_to_sample`, `normalize_episode_rewards`) are the natural first unit tests, using
-faked slime types the way the verl CI job fakes its seam.
+The experimental slime backend has no automated tests yet — its seams (`Sample`, Megatron
+shapes) are only meaningful against an installed slime, which the bare-metal CUDA 13 install
+makes impractical in CI. Verify changes with an end-to-end run per
+`backends/experimental/slime/SETUP.md`. The pure functions (`_to_sample`,
+`normalize_episode_rewards`) are the natural first unit tests, using faked slime types the
+way the verl CI job fakes its seam.
 
 ### Building and Pushing Docker Images
 
