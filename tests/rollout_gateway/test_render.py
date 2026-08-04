@@ -3,8 +3,15 @@
 Uses a tiny stub tokenizer (no transformers download) to assert the renderer calls
 apply_chat_template with the expected kwargs and decodes/parses output correctly. A
 real-tokenizer parity check lives in the Step 2 E2E path (against the live server).
+The schema-derender path (recognized chat template -> tokenizer.parse_response) is
+covered in test_response_schemas.py; this module covers the two-stage fallback.
 """
 
+import sys
+
+import pytest
+
+from agentcore_rl_toolkit.rollout_gateway.parsing import parse_tool_uses
 from agentcore_rl_toolkit.rollout_gateway.render import HfTemplateRenderer, ParsedOutput
 
 
@@ -12,13 +19,17 @@ class StubTokenizer:
     def __init__(self):
         self.last_kwargs = None
 
-    def apply_chat_template(self, messages, *, tools=None, tokenize=True, add_generation_prompt=True):
-        self.last_kwargs = dict(tools=tools, tokenize=tokenize, add_generation_prompt=add_generation_prompt)
+    def apply_chat_template(self, messages, *, tools=None, tokenize=True, add_generation_prompt=True, return_dict=True):
+        self.last_kwargs = dict(
+            tools=tools, tokenize=tokenize, add_generation_prompt=add_generation_prompt, return_dict=return_dict
+        )
         # deterministic: one id per message, +99 sentinel for the generation prompt
         ids = [len(m.get("content") or "") for m in messages]
         if add_generation_prompt:
             ids.append(99)
-        return ids
+        # mirror the real API: the default dict form bundles extras the renderer
+        # must opt out of with return_dict=False
+        return ids if not return_dict else {"input_ids": ids, "attention_mask": [1] * len(ids)}
 
     def decode(self, ids, skip_special_tokens=False):
         return " ".join(str(i) for i in ids)
@@ -29,7 +40,7 @@ def test_render_passes_expected_kwargs_and_returns_list():
     r = HfTemplateRenderer(tok)
     ids = r.render([{"role": "user", "content": "abc"}], tools=None, add_generation_prompt=True)
     assert ids == [3, 99]
-    assert tok.last_kwargs == {"tools": None, "tokenize": True, "add_generation_prompt": True}
+    assert tok.last_kwargs == {"tools": None, "tokenize": True, "add_generation_prompt": True, "return_dict": False}
 
 
 def test_parse_no_tools_returns_plain_text():
@@ -52,15 +63,15 @@ def test_parse_empty_output():
 
 def test_xml_tool_calls_parsed_dependency_free():
     """<tool_call><function=...> output is parsed by the regex path with no inference
-    engine (sglang/vllm) imported."""
-    import sys
+    engine (sglang/vllm) imported. The regex requires explicit injection — with tools
+    in play, an unrecognized template plus no injected parser is rejected."""
 
     # decode returns the raw XML tool-call text
     class XmlTok(StubTokenizer):
         def decode(self, ids, skip_special_tokens=False):
             return "<tool_call>\n<function=search>\n<parameter=q>cats</parameter>\n</function>\n</tool_call>"
 
-    r = HfTemplateRenderer(XmlTok())
+    r = HfTemplateRenderer(XmlTok(), tool_parser=parse_tool_uses)
     tools = [{"type": "function", "function": {"name": "search", "parameters": {}}}]
     out = r.parse([1], tools_schema=tools)
     assert "sglang" not in sys.modules and "vllm" not in sys.modules
@@ -129,12 +140,23 @@ def test_tool_parser_override_keeps_default_reasoning_split():
     assert out.tool_uses == [{"name": "x", "input": {"got": "body"}}]
 
 
-def test_reasoning_parser_override_keeps_default_tool_regex():
+def test_reasoning_parser_override_requires_explicit_tool_parser_for_tools():
+    """Overriding only the reasoning stage says nothing about the tool format, so
+    tool parsing still refuses to run on the implicit default regex; injecting
+    parse_tool_uses opts back in and the stages compose as before."""
+
     class XmlTok(StubTokenizer):
         def decode(self, ids, skip_special_tokens=False):
             return "REASON||<tool_call><function=x><parameter=q>v</parameter></function></tool_call>"
 
-    r = HfTemplateRenderer(XmlTok(), reasoning_parser=lambda raw: tuple(raw.split("||", 1)))
+    def split_on_bars(raw):
+        left, right = raw.split("||", 1)
+        return left, right
+
+    with pytest.raises(ValueError, match="matched no response schema"):
+        HfTemplateRenderer(XmlTok(), reasoning_parser=split_on_bars).parse([1], tools_schema=TOOLS)
+
+    r = HfTemplateRenderer(XmlTok(), reasoning_parser=split_on_bars, tool_parser=parse_tool_uses)
     out = r.parse([1], tools_schema=TOOLS)
     assert out.reasoning == "REASON"
     assert out.tool_uses == [{"name": "x", "input": {"q": "v"}}]
@@ -152,8 +174,3 @@ def test_tool_parser_skipped_without_tools_schema():
     assert calls == []  # no tools -> tool stage never runs
     assert out.reasoning == "hmm"
     assert out.text == "body"
-
-
-def test_tool_parser_ill_formed_propagates():
-    r = HfTemplateRenderer(ThinkTok(), tool_parser=lambda body, tools: (body, [], True))
-    assert r.parse([1], tools_schema=TOOLS).ill_formed is True
