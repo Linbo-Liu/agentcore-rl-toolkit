@@ -59,9 +59,7 @@ RUN apt-get update && \
 # ----------
 
 COPY . .
-# Install local toolkit from build context, then install example deps
-RUN --mount=type=bind,from=toolkit,source=.,target=/toolkit \
-    uv pip install /toolkit && uv pip install .
+RUN uv pip install .
 
 
 

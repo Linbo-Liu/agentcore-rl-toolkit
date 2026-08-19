@@ -131,26 +131,23 @@ GLM4MOE_SCHEMA = {
 }
 
 # GPT-OSS (harmony): reasoning/content are channels, tool calls carry the function
-# name in the channel header.
 GPTOSS_SCHEMA = {
-    # Normalize final content to analysis format so both map to the same "content" group.
     "x-regex-substitutions": [
         [r"<\|channel\|>final<\|message\|>(.*?)<\|return\|>", r"<|channel|>analysis<|message|>\1<|end|>"],
     ],
-    "x-regex": r"^(?:<\|channel\|>analysis<\|message\|>(?P<content>.*?)<\|end\|>(?:<\|start\|>assistant)?)?\s*(?P<tool_calls>to=functions\.\S+<\|channel\|>commentary json<\|message\|>.*?<\|call\|>)?$",  # noqa: E501
+    "x-regex": r"^(?:<\|channel\|>analysis<\|message\|>(?P<reasoning_content>.*?)<\|end\|>(?:<\|start\|>assistant)?\s*(?=<\|channel\|>))?(?:<\|channel\|>analysis<\|message\|>(?P<content>.*?)<\|end\|>)?\s*(?P<tool_calls>(?:<\|channel\|>(?:commentary|analysis)\s+to=functions\.[a-zA-Z0-9_-]+\s+(?:code|json)<\|message\|>.*?<\|call\|>.*?(?:<\|end\|>|$)\s*)+)?$",  # noqa: E501
     "type": "object",
     "properties": {
         "role": {"const": "assistant"},
         "content": {"type": "string"},
+        "reasoning_content": {"type": "string"},
         "tool_calls": {
             "type": "array",
-            "x-regex-iterator": r"(to=functions\.\S+<\|channel\|>commentary json<\|message\|>.*?<\|call\|>)",
+            "x-regex-iterator": r"(<\|channel\|>(?:commentary|analysis)\s+to=functions\.[a-zA-Z0-9_-]+\s+(?:code|json)<\|message\|>.*?<\|call\|>)",  # noqa: E501
             "items": {
-                # Convert "to=functions.NAME<|channel|>commentary json<|message|>ARGS<|call|>"
-                # into '{"name": "NAME", "arguments": ARGS}' so it can be parsed as JSON.
                 "x-regex-substitutions": [
                     [
-                        r"to=functions\.(\S+)<\|channel\|>commentary json<\|message\|>(.*?)<\|call\|>",
+                        r"<\|channel\|>(?:commentary|analysis)\s+to=functions\.([a-zA-Z0-9_-]+)\s+(?:code|json)<\|message\|>(.*?)<\|call\|>",
                         r'{"name": "\1", "arguments": \2}',
                     ],
                 ],
@@ -202,6 +199,59 @@ _TEMPLATE_HASHES: dict[str, str] = {
     "575fb74f54ed264df9047d0ecce3c98938aae953fb4f50356675706264cbb68a": "qwen3_5",  # Nemotron-3 Super
     "82753bef5cedc4932c1ed509b5c9a12be680fd86d1adb65bc3f7398d11c8eebc": "qwen3_5",  # Nemotron-3 Ultra
 }
+
+
+# --- Render-side template repairs ---------------------------------------------------
+
+# GPT-OSS renders a tool call with the recipient in the *role header* and defaults the
+# content type to "json":
+#     <|start|>assistant to=functions.NAME<|channel|>commentary json<|message|>ARGS<|call|>
+# The model instead generates the recipient *inside the channel line*, with "code":
+#     <|start|>assistant<|channel|>commentary to=functions.NAME code<|message|>ARGS<|call|>
+# (Verified at token level: the model emits a bare ` code` text token, not the harmony
+# spec's `<|constrain|>` special token 200003 — that token decodes visibly and never
+# appeared in captured rollouts.)
+#
+# Rendering a replayed history therefore does not reproduce the tokens that were
+# sampled, so the next turn's prompt stops extending the captured sequence and the
+# trajectory manager has to REALIGN (dropping the turn's loss mask) or FORK (emitting
+# an extra row). Reordering the render to match generation restores the prefix.
+#
+# Applies to the render path only; the parse path is handled by GPTOSS_SCHEMA.
+_GPTOSS_TOOLCALL_RENDER_ORIG = (
+    '            {{- "<|start|>assistant to=" }}\n'
+    '            {{- "functions." + tool_call.name + "<|channel|>commentary " }}\n'
+    '            {{- (tool_call.content_type if tool_call.content_type is defined else "json") + "<|message|>" }}'
+)
+_GPTOSS_TOOLCALL_RENDER_FIXED = (
+    '            {{- "<|start|>assistant<|channel|>commentary to=" }}\n'
+    '            {{- "functions." + tool_call.name + " " }}\n'
+    '            {{- (tool_call.content_type if tool_call.content_type is defined else "code") + "<|message|>" }}'
+)
+
+
+# Canonical messages carry reasoning under ``reasoning_content`` (both adapters
+# normalize to it). Templates disagree on the key: Qwen3 reads ``reasoning_content``
+# directly, while GPT-OSS/harmony reads ``thinking`` and silently ignores anything
+# else — so replayed reasoning renders as nothing and the prompt stops reproducing
+# the sampled tokens. Rename at the render seam for templates that need it.
+_REASONING_RENDER_KEY: dict[str, str] = {"gptoss": "thinking"}
+
+
+def reasoning_render_key(schema_name: str | None) -> str | None:
+    """Template-specific key for assistant reasoning, or None to leave messages alone."""
+    return _REASONING_RENDER_KEY.get(schema_name or "")
+
+
+def patch_chat_template(template: str, schema_name: str | None) -> str:
+    """Return ``template`` with render-side repairs applied, or unchanged.
+
+    Only rewrites a block that is present exactly once, so a template revised upstream
+    silently keeps its own rendering rather than being half-patched.
+    """
+    if schema_name != "gptoss" or template.count(_GPTOSS_TOOLCALL_RENDER_ORIG) != 1:
+        return template
+    return template.replace(_GPTOSS_TOOLCALL_RENDER_ORIG, _GPTOSS_TOOLCALL_RENDER_FIXED)
 
 
 def resolve_schema_name(tokenizer) -> str | None:
