@@ -111,13 +111,7 @@ python preprocess.py --s3-bucket-name my-migration-bench-data
 python preprocess.py --s3-bucket-name my-migration-bench-data --max-repos-per-split 2 --skip-s3-sync
 ```
 
-After data preprocessing is done, you can start testing the agent. First, prepare the environment file so Strands runs in non-interactive server mode:
-
-```bash
-cp .env.example .env
-```
-
-Then start the vLLM server, the app, and submit a request. Each command runs in its own terminal:
+After data preprocessing is done, you can start testing the agent. Start the vLLM server, the app, and submit a request. Each command runs in its own terminal:
 
 ```bash
 # Terminal 1: Start a local vLLM server
@@ -166,60 +160,6 @@ curl -X POST http://localhost:8080/invocations \
 > agent at `repo_uri`s from a **bucket you control** — the extracted code and the prompt both
 > drive a powerful agent.
 
-## Docker
-
-### Build & run locally
-
-Build the docker image:
-
-```bash
-docker buildx build \
-  --build-context toolkit=$TOOLKIT_ROOT \
-  -t migration:dev --load \
-  -f $MIGRATION_DIR/Dockerfile \
-  $MIGRATION_DIR
-```
-
-The agent inside the container needs AWS credentials to access S3 (for saving rollout results and downloading datasets). Since Docker containers can't access your host's AWS credential, you need to pass them explicitly via an `.env` file:
-
-```bash
-cp $MIGRATION_DIR/.env.example $MIGRATION_DIR/.env
-# Edit .env and add your AWS credentials.
-# If you have configured your AWS credential, you should be able to find
-# them at ~/.aws/credentials.
-# AWS_ACCESS_KEY_ID=your_access_key_id
-# AWS_SECRET_ACCESS_KEY=your_secret_access_key
-# AWS_REGION=us-west-2
-```
-
-Then start the server as follows, and send the request.
-```bash
-# Run with host network so the agent can access the locally hosted vLLM server
-docker run --network host --env-file $MIGRATION_DIR/.env migration:dev python -m rl_app
-
-# Submit request (same curl as above)
-```
-
-### Build & push to ECR
-
-You need to build docker and push it to AWS ECR for deploying agent, running evaluation or running RL training with AgentCore.
-
-```bash
-cd $TOOLKIT_ROOT
-cp .env.example .env
-# Edit .env and fill in your AWS region, account ID, and ECR repo name before proceeding
-# AWS_REGION=us-west-2
-# AWS_ACCOUNT=your-aws-account-number
-# ECR_REPO_NAME=your-ecr-repo-name
-# The script uses the AWS CLI, which reads credentials from ~/.aws/credentials.
-# Make sure this is configured (e.g., run `aws configure`) before proceeding.
-
-./scripts/build_docker_image_and_push_to_ecr.sh \
-  --dockerfile=$MIGRATION_DIR/Dockerfile \
-  --tag=dev \
-  --context=$MIGRATION_DIR \
-  --additional-context=toolkit=$TOOLKIT_ROOT
-```
 
 ## CodeArtifact Mirror (Optional)
 
@@ -242,45 +182,13 @@ aws codeartifact associate-external-connection \
   --external-connection public:maven-central
 ```
 
-### 2. Add IAM permissions to the ACR execution role
+### 2. Set environment variables
 
-Add the following policy to the IAM execution role your ACR agent runs as (replace `REGION`, `ACCOUNT`, and `YOUR_EXECUTION_ROLE`):
+When running locally, copy the example env file and add these to your `.env` file so they are picked up by `load_dotenv()`:
 
 ```bash
-aws iam put-role-policy \
-  --role-name YOUR_EXECUTION_ROLE \
-  --policy-name CodeArtifactAccess \
-  --policy-document '{
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Effect": "Allow",
-        "Action": [
-          "codeartifact:GetAuthorizationToken",
-          "codeartifact:GetRepositoryEndpoint"
-        ],
-        "Resource": [
-          "arn:aws:codeartifact:REGION:ACCOUNT:domain/migration-aws-maven-mirror",
-          "arn:aws:codeartifact:REGION:ACCOUNT:repository/migration-aws-maven-mirror/maven-central-cache"
-        ]
-      },
-      {
-        "Effect": "Allow",
-        "Action": "sts:GetServiceBearerToken",
-        "Resource": "*",
-        "Condition": {
-          "StringEquals": {
-            "sts:AWSServiceName": "codeartifact.amazonaws.com"
-          }
-        }
-      }
-    ]
-  }'
+cp .env.example .env
 ```
-
-### 3. Set environment variables
-
-Add to your `.env` file (picked up by `deploy.py`):
 
 ```
 CODEARTIFACT_DOMAIN=migration-aws-maven-mirror
@@ -288,49 +196,153 @@ CODEARTIFACT_OWNER=123456789012
 CODEARTIFACT_REPO=maven-central-cache
 ```
 
-These are picked up automatically by `--env-file` when running Docker locally, and by `deploy.py` when deploying to ACR.
-
 When these environment variables are not set, the agent uses Maven Central directly (default behavior). At startup, `configure_codeartifact_token()` fetches an auth token via boto3 and generates `~/.m2/settings.xml` automatically.
 
-## Deploy
 
-Create your `config.toml` file and fill in the `[agentcore]` section:
+## Deploy to AgentCore
+
+### 1. Configure the agent
+
+Pick the option that matches where your inference server lives.
+
+**Option 1: VPC deployment** — use this when your inference server is inside a VPC (e.g., training infra on AWS).
+
+```bash
+cd $MIGRATION_DIR
+
+# Get your subnet and security group IDs from your instance's network details
+SUBNET_ID="subnet-xxxxxxxxxxxxxxxxx"
+SECURITY_GROUP_ID="sg-xxxxxxxxxxxxxxxxx"
+
+agentcore configure \
+  --entrypoint rl_app.py \
+  --name strands_migration_agent \
+  --requirements-file pyproject.toml \
+  --deployment-type container \
+  --vpc \
+  --subnets $SUBNET_ID \
+  --security-groups $SECURITY_GROUP_ID \
+  --disable-memory \
+  --non-interactive
+```
+
+**Option 2: Public net deployment** — use this when your inference server is accessible via a public URL.
+
+```bash
+cd $MIGRATION_DIR
+
+agentcore configure \
+  --entrypoint rl_app.py \
+  --name strands_migration_agent \
+  --requirements-file pyproject.toml \
+  --deployment-type container \
+  --disable-memory \
+  --non-interactive
+```
+
+### 2. Deploy the agent
+
+```bash
+cd $MIGRATION_DIR
+
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+
+agentcore deploy --agent strands_migration_agent \
+  --env CODEARTIFACT_DOMAIN=migration-aws-maven-mirror \
+  --env CODEARTIFACT_OWNER=$ACCOUNT \
+  --env CODEARTIFACT_REPO=maven-central-cache
+```
+
+> If you are not using the CodeArtifact mirror, omit the three `CODEARTIFACT_*` env vars from the deploy command.
+
+After deployment, the agent ARN is saved in `.bedrock_agentcore.yaml`. Copy it — you will need it for evaluation.
+
+### 3. Setup IAM Permissions for ACR
+Grant IAM permissions to the ACR execution role. The execution role name is stored in `.bedrock_agentcore.yaml` — the `execution_role` field, e.g.
+`arn:aws:iam::123456789:role/AmazonBedrockAgentCoreSDKRuntime-us-west-2-abc123` ->
+`AmazonBedrockAgentCoreSDKRuntime-us-west-2-abc123`.
+
+#### 3.1 Grant S3 permission
+
+```bash
+# Create an S3 bucket to store ACR rollout data
+aws s3 mb s3://agentcore-rl
+
+# Add S3 permissions to the execution role,
+# which is the first `execution_role` in `.bedrock_agentcore.yaml`.
+YOUR_EXECUTION_ROLE=$(grep -m1 'execution_role:' .bedrock_agentcore.yaml | sed 's|.*role/||')
+echo "Execution role: $YOUR_EXECUTION_ROLE"
+
+aws iam put-role-policy --role-name $YOUR_EXECUTION_ROLE \
+  --policy-name RLToolkitAccess \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Action": ["s3:PutObject", "s3:GetObject"],
+        "Resource": "arn:aws:s3:::agentcore-rl/*"
+      }
+    ]
+  }'
+```
+
+#### 3.2 Grant CodeArtifact permission
+
+Skip this step if you are not using the [CodeArtifact mirror](#codeartifact-mirror-optional).
+
+```bash
+cd $MIGRATION_DIR
+
+REGION=$(aws ec2 describe-availability-zones --query 'AvailabilityZones[0].RegionName' --output text)
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+
+aws iam put-role-policy \
+  --role-name $YOUR_EXECUTION_ROLE \
+  --policy-name CodeArtifactAccess \
+  --policy-document "$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "codeartifact:GetAuthorizationToken",
+        "codeartifact:GetRepositoryEndpoint"
+      ],
+      "Resource": [
+        "arn:aws:codeartifact:${REGION}:${ACCOUNT}:domain/migration-aws-maven-mirror",
+        "arn:aws:codeartifact:${REGION}:${ACCOUNT}:repository/migration-aws-maven-mirror/maven-central-cache"
+      ]
+    },
+    {
+      "Effect": "Allow",
+      "Action": "sts:GetServiceBearerToken",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "sts:AWSServiceName": "codeartifact.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
+EOF
+)"
+```
+
+## Evaluate
+
+After deploying the agent to ACR, you can run batch evaluation against the MigrationBench dataset. The evaluation scripts use `RolloutClient` to submit requests to ACR and poll S3 for results.
+
+First, create `config.toml` from the example and fill in the `agent_arn` and `[eval]` section:
 
 ```bash
 cd $MIGRATION_DIR
 cp config.example.toml config.toml
 ```
 
-Edit `config.toml` with your deployment values:
-
-```toml
-[agentcore]
-region = "us-west-2"
-agent_name = "my_strands_migration_agent"
-image_uri = "ACCOUNT_ID.dkr.ecr.REGION.amazonaws.com/example-agent:tag"  # ECR image URI from the push step
-execution_role_arn = "arn:aws:iam::ACCOUNT_ID:role/EXAMPLE_ROLE"
-
-# Network configuration (optional — omit for PUBLIC mode)
-network_mode = "VPC"
-subnets = ["subnet-xxxxxxxxxxxxxxxxx"]
-security_groups = ["sg-xxxxxxxxxxxxxxxxx"]
-```
-
-Then run:
-
-```bash
-python deploy.py
-```
-
-The deploy script will print the Amazon Resource Name (ARN) of your deployed agent in its output log. Copy this value — you will need it for evaluation.
-
-## Evaluate
-
-After deploying the agent to ACR, you can run batch evaluation against the MigrationBench dataset. The evaluation scripts use `RolloutClient` to submit requests to ACR and poll S3 for results.
-
-First, fill in the `agent_arn` and the `[eval]` section in your `config.toml`:
-
-- **`agent_arn`**: The ARN printed in the deploy step output log.
+- **`agent_arn`**: The ARN saved in `.bedrock_agentcore.yaml` after the deploy step.
 - **`s3_input_bucket`**: The S3 path where `preprocess.py` uploaded the dataset. For example, if you ran `python preprocess.py --s3-bucket-name my-migration-bench-data`, the test split is at `my-migration-bench-data/tars/test/`.
 - **`s3_output_bucket`**: The S3 bucket where evaluation rollout results will be saved.
 

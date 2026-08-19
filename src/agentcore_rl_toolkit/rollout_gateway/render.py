@@ -33,7 +33,12 @@ from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
 from .parsing import split_reasoning
-from .response_schemas import RESPONSE_SCHEMAS, resolve_schema_name
+from .response_schemas import (
+    RESPONSE_SCHEMAS,
+    patch_chat_template,
+    reasoning_render_key,
+    resolve_schema_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,10 +143,24 @@ class HfTemplateRenderer:
         # available by explicit injection.
         self.tool_parser: ToolParserFn | None = tool_parser
         self._schema: dict | None = None
+        # Render-side template repair, independent of the parse path: some templates do
+        # not render what their model generates, which breaks prefix reuse on replay.
+        # Held here and passed per-call rather than assigned onto the tokenizer, so a
+        # tokenizer shared with the trainer is never mutated.
+        self._chat_template: str | None = None
+        schema_name = resolve_schema_name(tokenizer)
+        template = getattr(tokenizer, "chat_template", None)
+        if schema_name is not None and isinstance(template, str):
+            patched = patch_chat_template(template, schema_name)
+            if patched != template:
+                self._chat_template = patched
+                logger.info("applied render-side chat-template repair for %r", schema_name)
+        # Key this template expects for assistant reasoning, when it isn't the canonical
+        # ``reasoning_content`` (see _rekey_reasoning).
+        self._reasoning_key: str | None = reasoning_render_key(schema_name)
         if reasoning_parser is None and tool_parser is None:
             # tokenizer.parse_response is guaranteed by the transformers>=5.0 floor
             # (the [gateway] extra); no availability guard needed.
-            schema_name = resolve_schema_name(tokenizer)
             if schema_name is not None:
                 self._schema = RESPONSE_SCHEMAS[schema_name]
 
@@ -156,13 +175,39 @@ class HfTemplateRenderer:
         # transformers>=5 default) bundles an attention mask, but that is a padding
         # artifact the training backend builds itself when it batches rows.
         ids = self.tokenizer.apply_chat_template(
-            messages,
+            self._rekey_reasoning(messages),
             tools=tools,
             tokenize=True,
             add_generation_prompt=add_generation_prompt,
             return_dict=False,
+            **({"chat_template": self._chat_template} if self._chat_template else {}),
         )
         return list(ids)
+
+    def _rekey_reasoning(self, messages: list[dict]) -> list[dict]:
+        """Move assistant ``reasoning_content`` to the key this template reads.
+
+        Copies before mutating, so a caller's messages (and the manager's stored
+        history, which is compared by dict equality) are never touched.
+
+        Skipped when the message also carries text: harmony renders whichever of
+        ``content``/``thinking`` is set as the analysis channel and raises outright if
+        a tool-call message sets both, so text wins and the reasoning is left out
+        rather than trading a drift for a template exception.
+        """
+        key = self._reasoning_key
+        if not key:
+            return messages
+        out: list[dict] = []
+        for msg in messages:
+            reasoning = msg.get("reasoning_content") if msg.get("role") == "assistant" else None
+            if not reasoning or msg.get("content"):
+                out.append(msg)
+                continue
+            rekeyed = {k: v for k, v in msg.items() if k != "reasoning_content"}
+            rekeyed[key] = reasoning
+            out.append(rekeyed)
+        return out
 
     def get_stop_sequences(self) -> list[str] | list[int]:
         return list(self._stop_sequences)

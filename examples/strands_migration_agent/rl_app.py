@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 
 from dotenv import load_dotenv
@@ -11,6 +12,9 @@ from strands_tools import editor, shell
 from utils import configure_codeartifact_token, load_metadata_from_s3, load_repo_from_s3, setup_repo_environment
 
 from agentcore_rl_toolkit import AgentCoreRLApp
+
+os.environ.setdefault("BYPASS_TOOL_CONSENT", "true")
+os.environ.setdefault("STRANDS_NON_INTERACTIVE", "true")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,6 +50,7 @@ def invoke_agent(payload: dict):
     base_url = payload["_rollout"]["base_url"]
     model_id = payload["_rollout"]["model_id"]
     params = payload["_rollout"].get("sampling_params", {})
+    api_key = payload["_rollout"].get("api_key") or "EMPTY"
     tools = [shell, editor]
 
     request = InvocationRequest(**payload)
@@ -76,7 +81,7 @@ def invoke_agent(payload: dict):
         )
         tools.append(search_dependency_version)
 
-    model = OpenAIModel(client_args={"api_key": "EMPTY", "base_url": base_url}, model_id=model_id, params=params)
+    model = OpenAIModel(client_args={"api_key": api_key, "base_url": base_url}, model_id=model_id, params=params)
 
     agent = Agent(
         model=model,
