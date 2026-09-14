@@ -120,6 +120,14 @@ class AgentCoreAgentLoop(AgentLoopBase):
         linear_on_nonlinear: str = "reset",
         reward_mode: str = "built_in",
         reward_extra_info_defaults: dict | None = None,
+        # {name: threshold} -> emit reward_extra_info[name] = 1.0 if reward >= threshold.
+        # Derives success-rate series from the agent's scalar reward without the agent
+        # having to report them, so no container rebuild is needed. Chief use: a
+        # graded reward whose mean is not a pass rate. For MigrationReward
+        # (0.0 build failed / 0.5 built but tests not preserved / 1.0 both),
+        # {"pass_at_1": 1.0, "build_success": 0.5} recovers both stages — a mean of
+        # 0.67 is equally 67% full passes or 34% full passes plus 66% half credit.
+        reward_thresholds: dict | None = None,
         **kwargs,  # swallows the YAML entry's `name`, verl's `tools`, and future kwargs
     ):
         super().__init__(trainer_config, server_manager, tokenizer, processor, dataset_cls, data_config, **kwargs)
@@ -157,6 +165,13 @@ class AgentCoreAgentLoop(AgentLoopBase):
         self._rei_defaults = {str(k): float(v) for k, v in (reward_extra_info_defaults or {}).items()}
         # verl already derives its `reward` validation metric from rm_scores.
         self._rei_defaults.pop("reward", None)
+        self._reward_thresholds = {str(k): float(v) for k, v in (reward_thresholds or {}).items()}
+        # Threshold names join the defaults so every emitted row carries them. That is
+        # how key consistency across a batch is guaranteed here — verl reconciles
+        # reward_extra_info keys positionally and a missing key becomes a None it
+        # cannot average.
+        for name in self._reward_thresholds:
+            self._rei_defaults.setdefault(name, 0.0)
         self.model_id = self.config.actor_rollout_ref.model.path
 
         self._gateway: GatewayHandle = get_or_start_gateway(
@@ -303,14 +318,16 @@ class AgentCoreAgentLoop(AgentLoopBase):
             primary = max(range(len(records)), key=lambda i: sum(records[i].loss_mask))
             records.append(records.pop(primary))
 
-        shared_extra["reward_extra_info"] = self._reward_extra_info(result, len(records), failed=error is not None)
+        shared_extra["reward_extra_info"] = self._reward_extra_info(
+            result, reward, len(records), failed=error is not None
+        )
 
         outputs = [
             self._record_to_output(r, i, reward, num_turns, shared_extra, elapsed) for i, r in enumerate(records)
         ]
         return outputs
 
-    def _reward_extra_info(self, result: dict[str, Any] | None, n_records: int, *, failed: bool) -> dict:
+    def _reward_extra_info(self, result: dict[str, Any] | None, reward: float, n_records: int, *, failed: bool) -> dict:
         info: dict[str, float] = dict(self._rei_defaults)
         metrics = (result or {}).get("metrics") or {}
         if isinstance(metrics, dict):
@@ -321,6 +338,30 @@ class AgentCoreAgentLoop(AgentLoopBase):
                         info[k] = float(v)
                     except (TypeError, ValueError):
                         continue
+        # The agent's scalar reward, carried as a plain per-row float.
+        #
+        # Deliberately NOT keyed "reward": verl fills reward_extra_info["reward"] itself
+        # from rm_scores, and writing to the same key appends to that list instead of
+        # replacing it (trainer_base.py omits "reward" from its None-padding loop but not
+        # from the append loop), leaving it twice as long as every other key.
+        #
+        # It is also not redundant with verl's "reward". verl does not carry the scalar:
+        # it writes reward_score into one cell of a token-length tensor at
+        # `attention_mask[:, prompt_length:].sum(dim=1) - 1` and sums it back out
+        # (experimental/agent_loop/agent_loop.py). A row with an empty response region
+        # gives index -1, so the value is not recoverable as that row's score and the sum
+        # reads 0 -- which is how a forked leaf with no trained response can report
+        # reward 0 while its shared reward_extra_info still reports a pass. This key
+        # bypasses that round-trip entirely, so agent_reward vs reward measures how much
+        # the tensor path loses.
+        info["agent_reward"] = float(reward)
+        # Thresholds derive from the same scalar in the same place, so
+        # pass_at_1 <= agent_reward holds by construction (it need not hold against
+        # verl's "reward"). Applied after the agent's own metrics, so a configured
+        # threshold wins over an agent-reported key of the same name: the threshold is set
+        # explicitly by whoever runs the training, and a silent disagreement is worse.
+        for name, threshold in self._reward_thresholds.items():
+            info[name] = 1.0 if float(reward) >= threshold else 0.0
         info["acr_failed"] = 1.0 if failed else 0.0
         info["num_trace_records"] = float(n_records)
         return info
