@@ -30,7 +30,7 @@ class FakeRenderer:
     def _encode(self, text: str) -> list[int]:
         return [self._id(t) for t in text.split()]
 
-    def render(self, messages, *, tools=None, add_generation_prompt=True, chat_template_kwargs=None):
+    async def render(self, messages, *, tools=None, add_generation_prompt=True, chat_template_kwargs=None):
         self.render_kwargs.append(chat_template_kwargs)
         ids: list[int] = []
         for m in messages:
