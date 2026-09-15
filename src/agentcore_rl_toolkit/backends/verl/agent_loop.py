@@ -160,8 +160,12 @@ class AgentCoreAgentLoop(AgentLoopBase):
         # verl already derives its `reward` validation metric from rm_scores.
         self._rei_defaults.pop("reward", None)
         self._reward_thresholds = {str(k): float(v) for k, v in (reward_thresholds or {}).items()}
-        for name in self._reward_thresholds:
-            self._rei_defaults.setdefault(name, 0.0)
+        if collisions := sorted(set(self._rei_defaults) & set(self._reward_thresholds)):
+            raise ValueError(
+                f"reward_thresholds and reward_extra_info_defaults both declare {collisions}. "
+                "A threshold is derived from the reward and would overwrite the agent-reported "
+                "metric of the same name. Rename one side."
+            )
         self.model_id = self.config.actor_rollout_ref.model.path
 
         self._gateway: GatewayHandle = get_or_start_gateway(
