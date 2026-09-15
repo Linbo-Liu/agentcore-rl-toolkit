@@ -120,6 +120,8 @@ class AgentCoreAgentLoop(AgentLoopBase):
         linear_on_nonlinear: str = "reset",
         reward_mode: str = "built_in",
         reward_extra_info_defaults: dict | None = None,
+        # {name: threshold} -> emit reward_extra_info[name] = 1.0 if reward >= threshold.
+        reward_thresholds: dict | None = None,
         **kwargs,  # swallows the YAML entry's `name`, verl's `tools`, and future kwargs
     ):
         super().__init__(trainer_config, server_manager, tokenizer, processor, dataset_cls, data_config, **kwargs)
@@ -157,6 +159,13 @@ class AgentCoreAgentLoop(AgentLoopBase):
         self._rei_defaults = {str(k): float(v) for k, v in (reward_extra_info_defaults or {}).items()}
         # verl already derives its `reward` validation metric from rm_scores.
         self._rei_defaults.pop("reward", None)
+        self._reward_thresholds = {str(k): float(v) for k, v in (reward_thresholds or {}).items()}
+        if collisions := sorted(set(self._rei_defaults) & set(self._reward_thresholds)):
+            raise ValueError(
+                f"reward_thresholds and reward_extra_info_defaults both declare {collisions}. "
+                "A threshold is derived from the reward and would overwrite the agent-reported "
+                "metric of the same name. Rename one side."
+            )
         self.model_id = self.config.actor_rollout_ref.model.path
 
         self._gateway: GatewayHandle = get_or_start_gateway(
@@ -303,14 +312,16 @@ class AgentCoreAgentLoop(AgentLoopBase):
             primary = max(range(len(records)), key=lambda i: sum(records[i].loss_mask))
             records.append(records.pop(primary))
 
-        shared_extra["reward_extra_info"] = self._reward_extra_info(result, len(records), failed=error is not None)
+        shared_extra["reward_extra_info"] = self._reward_extra_info(
+            result, reward, len(records), failed=error is not None
+        )
 
         outputs = [
             self._record_to_output(r, i, reward, num_turns, shared_extra, elapsed) for i, r in enumerate(records)
         ]
         return outputs
 
-    def _reward_extra_info(self, result: dict[str, Any] | None, n_records: int, *, failed: bool) -> dict:
+    def _reward_extra_info(self, result: dict[str, Any] | None, reward: float, n_records: int, *, failed: bool) -> dict:
         info: dict[str, float] = dict(self._rei_defaults)
         metrics = (result or {}).get("metrics") or {}
         if isinstance(metrics, dict):
@@ -321,6 +332,10 @@ class AgentCoreAgentLoop(AgentLoopBase):
                         info[k] = float(v)
                     except (TypeError, ValueError):
                         continue
+
+        info["agent_reward"] = float(reward)
+        for name, threshold in self._reward_thresholds.items():
+            info[name] = 1.0 if float(reward) >= threshold else 0.0
         info["acr_failed"] = 1.0 if failed else 0.0
         info["num_trace_records"] = float(n_records)
         return info
