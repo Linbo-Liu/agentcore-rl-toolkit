@@ -1,7 +1,8 @@
 #!/usr/bin/env python
-"""Unit tests for :class:`AgentCoreSession`'s data-plane client: one client per session
-(start, setup, every status poll, the dump, the delete), not one per call, and a client
-per call for anyone calling the helpers standalone. Fake aioboto3 session, no AWS.
+"""Unit tests for :class:`AgentCoreHttpSession`'s data-plane client: every call a session
+makes (start, setup, every status poll, the dump, the delete) rides on the process-wide
+client rather than one of its own, no session closes it, and anyone calling the helpers
+standalone still gets a client per call. Fake aioboto3 session, no AWS.
 """
 
 import asyncio
@@ -11,10 +12,12 @@ from unittest import IsolatedAsyncioTestCase, mock
 
 from agentcore_rl_toolkit.aws_tools.agentcore_tools import (
     SESSION_CLIENT_CONFIG,
+    close_shared_agentcore_clients,
     invoke_agentcore_session,
 )
 from agentcore_rl_toolkit.aws_tools.persistent_dict import NullPersister, PersistentDict
-from agentcore_rl_toolkit.rollout_session.agentcore_session import AgentCoreSession
+from agentcore_rl_toolkit.rollout_session.agentcore_http_session import AgentCoreHttpSession
+from agentcore_rl_toolkit.rollout_session.exception_utils import describe_with_root_cause, root_cause
 from agentcore_rl_toolkit.rollout_session.wire import (
     InvocationRequest,
     InvocationResponse,
@@ -33,7 +36,7 @@ STATUS_REQUEST = InvocationRequest(payload=RolloutStatusRequest()).model_dump_js
 
 
 class ResourceNotFoundException(Exception):
-    """Matched by name, the way ``stop_agentcore_session`` matches it."""
+    """Matched by name, the way ``stop_agentcore_instance_session`` matches it."""
 
 
 class FakeBody:
@@ -88,6 +91,8 @@ class FakeClient:
         self._record("delete")
         if self.recorder.deletes_missing:
             raise ResourceNotFoundException("session already gone")
+        if self.recorder.delete_error is not None:
+            raise self.recorder.delete_error
 
 
 class FakeClientContext:
@@ -108,11 +113,17 @@ class FakeClientContext:
 class Recorder:
     """Counts the clients a run opened, and logs every call across all of them."""
 
-    def __init__(self, pending_polls: int = 0, deletes_missing: bool = False):
+    def __init__(
+        self,
+        pending_polls: int = 0,
+        deletes_missing: bool = False,
+        delete_error: Exception | None = None,
+    ):
         self.clients: list[FakeClient] = []
         self.calls: list[str] = []
         self.pending_polls = pending_polls
         self.deletes_missing = deletes_missing
+        self.delete_error = delete_error
 
     def session(self):
         recorder = self
@@ -153,8 +164,8 @@ def no_sleep():
     return mock.patch("asyncio.sleep", _sleep)
 
 
-def session(session_id: str = "s1") -> AgentCoreSession:
-    return AgentCoreSession(
+def session(session_id: str = "s1") -> AgentCoreHttpSession:
+    return AgentCoreHttpSession(
         session_id,
         session_state=PersistentDict({"session_id": session_id}, persister=NullPersister()),
         runtime_arn=RUNTIME_ARN,
@@ -162,15 +173,22 @@ def session(session_id: str = "s1") -> AgentCoreSession:
     )
 
 
-async def run_rollout(s: AgentCoreSession) -> RolloutDumpResponse:
+async def run_rollout(s: AgentCoreHttpSession) -> RolloutDumpResponse:
     """One whole rollout: the lifecycle ``run_rollout_with_bounds`` drives."""
     async with s:
         await s.setup({"index": 1})
         return await s.run({"index": 1})
 
 
-class SharedClientTest(IsolatedAsyncioTestCase):
-    """Inside ``async with session``, one client serves every call it makes."""
+class SharedClientCase(IsolatedAsyncioTestCase):
+    """Base case: end the loop's shared client, so no client crosses into another test."""
+
+    async def asyncSetUp(self) -> None:
+        self.addAsyncCleanup(close_shared_agentcore_clients)
+
+
+class SharedClientTest(SharedClientCase):
+    """One process-wide client serves every call of every session."""
 
     async def test_one_client_for_a_whole_rollout_however_many_polls(self):
         recorder = Recorder(pending_polls=12)
@@ -184,7 +202,6 @@ class SharedClientTest(IsolatedAsyncioTestCase):
         client = recorder.clients[0]
         self.assertEqual(client.calls.count("rollout_status_request"), 14)
         self.assertEqual(len(client.calls), 19)
-        self.assertTrue(client.closed)
 
     async def test_the_calls_are_the_rollout_protocol_in_order(self):
         recorder = Recorder()
@@ -201,16 +218,20 @@ class SharedClientTest(IsolatedAsyncioTestCase):
                 "rollout_status_request",
                 "rollout_dump_request",
                 "delete",
-                "close",
             ],
         )
 
-    async def test_the_client_closes_only_after_the_delete(self):
-        # The teardown must ride the shared client too, hence closing it last.
+    async def test_a_finished_session_leaves_the_client_open_for_the_next_one(self):
+        # The session borrows the client; closing it here would tear the pool out from
+        # under every rollout still running.
         recorder = Recorder()
         with recorder.patch():
             await run_rollout(session())
-        self.assertEqual(recorder.calls[-2:], ["delete", "close"])
+            self.assertFalse(recorder.clients[0].closed)
+            await run_rollout(session("s2"))
+
+        self.assertEqual(len(recorder.clients), 1)
+        self.assertEqual(recorder.calls.count("close"), 0)
 
     async def test_the_shared_client_keeps_the_deep_retry_budget(self):
         # start_agentcore_session's budget: session creation is the throttled call.
@@ -226,17 +247,16 @@ class SharedClientTest(IsolatedAsyncioTestCase):
             await run_rollout(session())
         self.assertEqual(recorder.clients[0].region, REGION)
 
-    async def test_each_session_owns_its_own_client(self):
+    async def test_concurrent_sessions_share_the_one_client(self):
         recorder = Recorder()
         with recorder.patch():
             await asyncio.gather(*(run_rollout(session(f"s{i}")) for i in range(4)))
 
-        self.assertEqual(len(recorder.clients), 4)
-        self.assertTrue(all(c.closed for c in recorder.clients))
-        # Concurrent rollouts interleave without their calls landing on one another's client.
-        self.assertTrue(all(len(c.calls) == 7 for c in recorder.clients), [c.calls for c in recorder.clients])
+        # Four rollouts, one client, and every call accounted for on it: 7 per rollout.
+        self.assertEqual(len(recorder.clients), 1)
+        self.assertEqual(len(recorder.clients[0].calls), 28)
 
-    async def test_a_failing_rollout_still_closes_the_client(self):
+    async def test_a_failing_rollout_still_deletes_its_session(self):
         recorder = Recorder()
         with recorder.patch():
             with self.assertRaises(RuntimeError):
@@ -245,35 +265,101 @@ class SharedClientTest(IsolatedAsyncioTestCase):
                     raise RuntimeError("boom")
 
         self.assertEqual(len(recorder.clients), 1)
-        self.assertTrue(recorder.clients[0].closed)
         # Teardown still happened, on the still-open client.
-        self.assertEqual(recorder.calls[-2:], ["delete", "close"])
+        self.assertEqual(recorder.calls[-1], "delete")
+        self.assertFalse(recorder.clients[0].closed)
 
 
-class ShutdownTest(IsolatedAsyncioTestCase):
-    """``shutdown`` stays idempotent and safe whether or not a client is open."""
+class TeardownDoesNotMaskTest(SharedClientCase):
+    """A failing delete must not erase the error that ended the rollout."""
+
+    def chain(self, exc: BaseException) -> list[str]:
+        names, cur = [], exc
+        while cur is not None:
+            names.append(type(cur).__name__)
+            cur = cur.__cause__ or cur.__context__
+        return names
+
+    async def test_the_rollouts_error_survives_under_the_delete_error(self):
+        recorder = Recorder(delete_error=RuntimeError("403 Forbidden"))
+        with recorder.patch():
+            with self.assertRaises(RuntimeError) as caught:
+                async with (s := session()):
+                    await s.setup({})
+                    raise ValueError("the real error")
+
+        self.assertEqual(self.chain(caught.exception), ["RuntimeError", "ValueError"])
+        self.assertEqual(root_cause(caught.exception).args, ("the real error",))
+
+    async def test_a_cancelled_body_survives_too(self):
+        # The tell for the other hypothesis: rollouts torn down en masse, not rejected.
+        recorder = Recorder(delete_error=RuntimeError("403 Forbidden"))
+        with recorder.patch():
+            with self.assertRaises(RuntimeError) as caught:
+                async with (s := session()):
+                    await s.setup({})
+                    raise asyncio.CancelledError()
+
+        self.assertEqual(self.chain(caught.exception), ["RuntimeError", "CancelledError"])
+
+    async def test_a_delete_error_over_a_clean_body_has_no_chain(self):
+        recorder = Recorder(delete_error=RuntimeError("403 Forbidden"))
+        with recorder.patch():
+            with self.assertRaises(RuntimeError) as caught:
+                async with (s := session()):
+                    await s.setup({})
+
+        self.assertEqual(self.chain(caught.exception), ["RuntimeError"])
+
+    async def test_a_failed_delete_does_not_take_the_shared_client_down(self):
+        # The other rollouts on this client are unaffected by one session's bad teardown.
+        recorder = Recorder(delete_error=RuntimeError("403 Forbidden"))
+        with recorder.patch():
+            with self.assertRaises(RuntimeError):
+                async with (s := session()):
+                    await s.setup({})
+
+        self.assertEqual(recorder.calls[-1], "delete")
+        self.assertFalse(recorder.clients[0].closed)
+
+    async def test_the_summary_line_names_the_error_under_the_mask(self):
+        mask = RuntimeError("An error occurred (403) ... DeleteCapacityProviderSession")
+        mask.__context__ = ValueError("the real error")
+
+        described = describe_with_root_cause(mask)
+        self.assertIn("403", described)
+        self.assertIn("ValueError: the real error", described)
+        # Nothing to add when the exception is its own root cause.
+        self.assertEqual(describe_with_root_cause(ValueError("alone")), "alone")
+
+    async def test_a_context_cycle_does_not_hang_the_walk(self):
+        a, b = ValueError("a"), ValueError("b")
+        a.__context__, b.__context__ = b, a
+        self.assertIn(root_cause(a), (a, b))
+
+
+class ShutdownTest(SharedClientCase):
+    """``shutdown`` stays idempotent and safe whether or not the session was entered."""
 
     async def test_shutdown_on_a_session_that_was_never_entered(self):
+        # No phase owns the client, so a bare shutdown needs no scope around it.
         recorder = Recorder()
         with recorder.patch():
             await session().shutdown()
 
-        self.assertEqual(recorder.calls, ["delete", "close"])
+        self.assertEqual(recorder.calls, ["delete"])
         self.assertEqual(len(recorder.clients), 1)
 
-    async def test_shutdown_after_the_scope_opens_a_fresh_client(self):
-        # The session's client is gone by then, so the call must not reuse it.
+    async def test_shutdown_after_the_scope_reuses_the_shared_client(self):
         recorder = Recorder()
         with recorder.patch():
             s = session()
             async with s:
                 pass
-            held = recorder.clients[0]
             await s.shutdown()
 
-        self.assertEqual(len(recorder.clients), 2)
-        self.assertIsNot(recorder.clients[1], held)
-        self.assertTrue(all(c.closed for c in recorder.clients))
+        self.assertEqual(len(recorder.clients), 1)
+        self.assertEqual(recorder.calls, ["delete", "delete"])
 
     async def test_an_already_deleted_session_is_not_an_error(self):
         recorder = Recorder(deletes_missing=True)
@@ -282,7 +368,7 @@ class ShutdownTest(IsolatedAsyncioTestCase):
                 pass
             await session().shutdown()
 
-        self.assertEqual(recorder.calls, ["delete", "close", "delete", "close"])
+        self.assertEqual(recorder.calls, ["delete", "delete"])
 
     async def test_exiting_twice_shuts_down_once_more_but_never_raises(self):
         recorder = Recorder()
@@ -290,8 +376,18 @@ class ShutdownTest(IsolatedAsyncioTestCase):
             s = session()
             await s.__aenter__()
             await s.__aexit__(None, None, None)
-            await s.__aexit__(None, None, None)  # the scope is gone: plain shutdown
-        self.assertEqual(recorder.calls, ["delete", "close", "delete", "close"])
+            await s.__aexit__(None, None, None)
+        self.assertEqual(recorder.calls, ["delete", "delete"])
+
+    def test_two_regions_in_one_session_are_rejected_at_construction(self):
+        # One client serves both arns, so a cross-region pair could never have worked.
+        with self.assertRaises(AssertionError):
+            AgentCoreHttpSession(
+                "s1",
+                session_state=PersistentDict({"session_id": "s1"}, persister=NullPersister()),
+                runtime_arn=RUNTIME_ARN,
+                capacity_provider_arn=PROVIDER_ARN.replace(REGION, "eu-west-1"),
+            )
 
 
 class StandaloneCallTest(IsolatedAsyncioTestCase):

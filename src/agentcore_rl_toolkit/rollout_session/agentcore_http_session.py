@@ -1,19 +1,26 @@
-"""A rollout session that runs the agent in a Bedrock AgentCore runtime session."""
+"""A rollout session that drives the agent over the four-POST HTTP protocol.
+
+The agent runs as an HTTP server in a Bedrock AgentCore runtime session, and this session
+talks to it directly in :mod:`.wire`'s protocol -- setup, status polls, start, dump -- so
+completion and the trajectory arrive on an invoke response. The sibling
+:mod:`.agentcore_s3_session` reaches the same runtime with one fire-and-forget invoke and
+polls S3 for the result instead; both are registered in :mod:`.factory` (``agentcore_http``
+and ``agentcore_s3``).
+"""
 
 import json
 import logging
 import os
-from contextlib import AsyncExitStack
 from typing import Any
 
 import backoff
 
 from agentcore_rl_toolkit.aws_tools.agentcore_tools import (
-    agentcore_client,
     invoke_agentcore_session,
     region_of,
+    shared_agentcore_client,
     start_agentcore_session,
-    stop_agentcore_session,
+    stop_agentcore_instance_session,
 )
 from agentcore_rl_toolkit.aws_tools.persistent_dict import PersistentDict, measure_span_persistent
 from agentcore_rl_toolkit.rollout_session.lifecycle import RolloutSession
@@ -36,14 +43,15 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 logging.getLogger("backoff").setLevel(logging.ERROR)
 
 
-class AgentCoreSession(RolloutSession):
+class AgentCoreHttpSession(RolloutSession):
     """A rollout session backed by an HTTP server in a Bedrock AgentCore runtime session.
 
-    Entering the session opens one ``bedrock-agentcore`` client and every call it makes
-    -- start, setup, each status poll, the dump, the delete -- rides on that one client;
-    see :mod:`agentcore_rl_toolkit.aws_tools.agentcore_tools` for why. Outside that scope
-    the phases still work, each opening a client for itself, so ``shutdown`` remains safe
-    to call on a session that was never entered or is already closed.
+    Every call it makes -- start, setup, each status poll, the dump, the delete -- rides on
+    the process-wide ``bedrock-agentcore`` client (:func:`shared_agentcore_client`), because
+    sessions are constructed one per trajectory and a client per session would be a
+    connection pool per rollout. Nothing here owns that client's lifetime, so every phase
+    works whether or not the session was entered, and ``shutdown`` stays safe to call on a
+    session that never ran.
     """
 
     def __init__(
@@ -53,39 +61,29 @@ class AgentCoreSession(RolloutSession):
         runtime_arn: str,
         capacity_provider_arn: str,
     ):
+        # One client serves the runtime invokes and the capacity-provider delete, so both
+        # arns must name the same region -- they always do: the provider hosts the
+        # runtime's sessions. Checked here because nothing later reads the provider's region.
+        self.region = region_of(runtime_arn)
+        assert region_of(capacity_provider_arn) == self.region, "runtime and capacity provider are in two regions"
         self.session_id = session_id
         self.session_state = session_state
         self.runtime_arn = runtime_arn
         self.capacity_provider_arn = capacity_provider_arn
-        # Both live only inside `async with self`; `None` means "no shared client", which
-        # is what makes the phases fall back to a client per call.
-        self._client: Any | None = None
-        self._scope: AsyncExitStack | None = None
 
-    async def __aenter__(self) -> "AgentCoreSession":
-        # One client serves the runtime invokes and the capacity-provider delete, so both
-        # arns must name the same region -- they always do: the provider hosts the
-        # runtime's sessions.
-        region = region_of(self.runtime_arn)
-        assert region_of(self.capacity_provider_arn) == region, "runtime and capacity provider are in two regions"
-        scope = AsyncExitStack()
-        self._client = await scope.enter_async_context(agentcore_client(region))
-        # Pushed after the client, so it unwinds first: the delete goes over the shared
-        # client, which is closed only once shutdown has returned.
-        scope.push_async_callback(self.shutdown)
-        self._scope = scope
+    async def __aenter__(self) -> "AgentCoreHttpSession":
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        scope, self._scope = self._scope, None
-        if scope is None:
-            # Never entered (or already exited): still honour the teardown contract.
-            await self.shutdown()
-            return
-        try:
-            await scope.aclose()
-        finally:
-            self._client = None
+        # Nothing is suppressed and no exception is juggled: a failing shutdown propagates
+        # with the body's exception as its `__context__` (implicit chaining), so the error
+        # that ended the rollout stays reachable underneath a teardown error --
+        # `describe_with_root_cause` is what digs it out.
+        await self.shutdown()
+
+    async def _acr(self) -> Any:
+        """The shared client this session's calls ride on."""
+        return await shared_agentcore_client(self.region)
 
     async def setup(self, task: dict) -> None:
         await self.session_state.update(
@@ -94,18 +92,19 @@ class AgentCoreSession(RolloutSession):
                 "runtime_arn": self.runtime_arn,
             }
         )
+        client = await self._acr()
 
         async with measure_span_persistent("agentcore_setup", self.session_state):
-            await start_agentcore_session(self.runtime_arn, self.session_id, self._client)
+            await start_agentcore_session(self.runtime_arn, self.session_id, client)
 
         async with measure_span_persistent("task_setup", self.session_state):
-            await start_and_wait_setup(self.runtime_arn, self.session_id, task, self._client)
+            await start_and_wait_setup(self.runtime_arn, self.session_id, task, client)
 
     async def run(self, task: dict) -> RolloutDumpResponse:
-        return await start_and_wait_rollout(self.runtime_arn, self.session_id, task, self._client)
+        return await start_and_wait_rollout(self.runtime_arn, self.session_id, task, await self._acr())
 
     async def shutdown(self) -> None:
-        await stop_agentcore_session(self.capacity_provider_arn, self.session_id, self._client)
+        await stop_agentcore_instance_session(self.capacity_provider_arn, self.session_id, await self._acr())
 
 
 async def invoke_agent(
