@@ -22,7 +22,7 @@ This agent evaluates LLMs on the [OfficeBench](https://github.com/zlwang-cs/Offi
 ## Prerequisites
 
 - **AWS credentials**: IAM role with access to S3 and Bedrock AgentCore
-- **Docker**: With buildx support (for building arm64 images)
+- **AgentCore CLI**: `bedrock-agentcore-starter-toolkit` (pulled in via the example's `pyproject.toml`)
 
 ## Installation
 
@@ -62,43 +62,48 @@ s3://your-bucket/officebench/
 └── manifest.json
 ```
 
-### 2. Build Docker image & push to ECR
+### 2. Configure the agent
 
-The Dockerfile automatically clones the OfficeBench repo and copies the app scripts during build — no local clone needed for this step.
+Use the AgentCore CLI to generate a config (`.bedrock_agentcore.yaml`) and a default Dockerfile (under `.bedrock_agentcore/strands_officebench_agent/`):
 
 ```bash
-cd /path/to/agentcore-rl-toolkit
-
-./scripts/build_docker_image_and_push_to_ecr.sh \
-    --dockerfile=examples/strands_officebench_agent/Dockerfile \
-    --context=examples/strands_officebench_agent \
-    --additional-context=toolkit=. \
-    --tag=v1
+agentcore configure \
+    --entrypoint rl_app.py \
+    --name strands_officebench_agent \
+    --requirements-file pyproject.toml \
+    --deployment-type container \
+    --disable-memory \
+    --non-interactive
 ```
 
-Requires a `.env` file at the repo root:
-```
-AWS_REGION=xxxxx
-AWS_ACCOUNT=xxxxxxxxxxxxx
-ECR_REPO_NAME=xxxxxxxxxxxx
+If your inference server lives inside a VPC (e.g. a vLLM server on an AWS instance), add `--vpc --subnets $SUBNET_ID --security-groups $SECURITY_GROUP_ID` so the agent can reach it.
+
+### 3. Override the generated Dockerfile
+
+OfficeBench needs system-level dependencies (LibreOffice, Tesseract, ImageMagick) and a clone of the OfficeBench app scripts — none of which the auto-generated Dockerfile provides. This example ships a custom `Dockerfile` at the folder root that adds them; copy it over the generated one:
+
+```bash
+cp Dockerfile .bedrock_agentcore/strands_officebench_agent/Dockerfile
 ```
 
-### 3. Deploy to AgentCore
+### 4. Deploy
 
-Create your config file:
+```bash
+agentcore deploy --agent strands_officebench_agent
+```
+
+This builds the ARM64 image (via CodeBuild), pushes it to ECR, and creates the AgentCore Runtime. The resulting `agent_arn` is recorded in `.bedrock_agentcore.yaml`.
+
+Copy the config template and fill in the `agent_arn` (and any eval settings the benchmark scripts read):
+
 ```bash
 cp config.example.toml config.toml
-# Edit config.toml with your values (image_uri, execution_role_arn, etc.)
+# Edit config.toml:
+#   agentcore.agent_arn = "<the arn agentcore deploy printed>"
+#   eval.s3_input_bucket / s3_output_bucket / model_id / base_url
 ```
 
-Deploy:
-```bash
-python deploy.py
-```
-
-This prints the `agent_arn` — add it to `config.toml`.
-
-### 4. Run benchmark
+### 5. Run benchmark
 
 ```bash
 # Full 300-task benchmark
@@ -140,20 +145,11 @@ Results are saved to:
 
 ## Configuration
 
-Example configuration is in `config.toml`:
+Deployment settings (image URI, execution role, network mode, ECR repo, etc.) are managed by the AgentCore CLI in `.bedrock_agentcore.yaml` — you don't need to duplicate them in `config.toml`. What `config.toml` supplies to the benchmark scripts is the deployed `agent_arn` plus the evaluation-time settings:
 
 ```toml
 [agentcore]
-region = "us-west-2"
-agent_name = "my_strands_officebench_agent"
-image_uri = "123456789012.dkr.ecr.us-west-2.amazonaws.com/strands-officebench-agent:v1"
-execution_role_arn = "arn:aws:iam::123456789012:role/AgentCoreRuntime"
 agent_arn = "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/agent-id"
-
-# Network configuration (optional)
-network_mode = "VPC"
-subnets = ["subnet-xxx"]
-security_groups = ["sg-xxx"]
 
 [eval]
 s3_input_bucket = "s3://your-bucket/officebench/"
@@ -161,6 +157,8 @@ s3_output_bucket = "your-output-bucket"
 model_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 # base_url = "http://your-vllm-server:8000/v1"  # uncomment for vLLM
 ```
+
+To re-deploy with different network settings (e.g. attaching a VPC), re-run `agentcore configure` with the new flags and `agentcore deploy --agent strands_officebench_agent`.
 
 ### Switching models
 
@@ -234,8 +232,7 @@ strands_officebench_agent/
 ├── benchmark.py        # Full benchmark runner (ACR)
 ├── evaluate.py         # Batch evaluation via RolloutClient (ACR, lower-level)
 ├── preprocess.py       # Package OfficeBench tasks for S3
-├── deploy.py           # Deploy container to AgentCore
-├── Dockerfile          # ACR container (LibreOffice, Tesseract, apps)
+├── Dockerfile          # Custom ACR container (LibreOffice, Tesseract, OfficeBench apps) — copy over the auto-generated one
 ├── test_local.py       # Single-task local testing (no ACR)
 ├── run_local_eval.py   # Batch local evaluation (no ACR)
 ├── config.toml         # Your configuration (gitignored)
