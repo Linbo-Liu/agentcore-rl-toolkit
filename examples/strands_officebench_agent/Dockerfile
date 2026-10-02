@@ -37,9 +37,9 @@ RUN mkdir -p /testbed/data /testbed/calendar /testbed/emails
 
 COPY . .
 
-# Install local toolkit from build context, then install example deps
-RUN --mount=type=bind,from=toolkit,source=.,target=/toolkit \
-    uv pip install /toolkit && uv pip install .
+# agentcore-rl-toolkit comes from PyPI via pyproject.toml: `agentcore deploy` builds in
+# CodeBuild with a plain `docker build .`, so no extra build context is available.
+RUN uv pip install .
 
 RUN uv pip install aws-opentelemetry-distro==0.12.2
 
