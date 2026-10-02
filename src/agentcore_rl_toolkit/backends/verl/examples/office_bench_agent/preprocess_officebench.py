@@ -94,13 +94,13 @@ def main():
 
     testbeds = sorted({e["testbed_uri"] for e in entries})
     with concurrent.futures.ThreadPoolExecutor(max_workers=32) as pool:
-        has_testbed = dict(zip(testbeds, pool.map(lambda uri: testbed_exists(s3, uri), testbeds)))
+        has_testbed = dict(zip(testbeds, pool.map(lambda uri: testbed_exists(s3, uri), testbeds), strict=True))
         tasks = list(pool.map(lambda e: load_task(s3, e["task_uri"]), entries))
 
     val_tasks = split_task_ids(entries, args.val_fraction, args.seed)
 
     rows = {"train": [], "val": []}
-    for e, task in zip(entries, tasks):
+    for e, task in zip(entries, tasks, strict=True):
         payload = InvocationRequest(
             task_uri=e["task_uri"],
             # Resolve missing testbeds here, so the runtime never HEADs a missing key.
