@@ -41,17 +41,18 @@ class AgentCoreA2ASession(A2ARolloutSession):
         self,
         session_id: str,
         session_state: PersistentDict,
-        runtime_arn: str,
+        *,
+        agentcore_runtime_arn: str,
         capacity_provider_arn: str,
     ):
         super().__init__(session_id, session_state)
         # Runtime and provider must share a region (they always do); checked here because
         # nothing later reads the provider region.
-        self.region = region_of(runtime_arn)
+        self.region = region_of(agentcore_runtime_arn)
         assert region_of(capacity_provider_arn) == self.region, "runtime and capacity provider are in two regions"
-        self.runtime_arn = runtime_arn
+        self.runtime_arn = agentcore_runtime_arn
         self.capacity_provider_arn = capacity_provider_arn
-        self._url = runtime_invocations_url(runtime_arn)
+        self._url = runtime_invocations_url(agentcore_runtime_arn)
 
     async def _client(self) -> Client:
         return build_a2a_client(await shared_sigv4_httpx_client(self.region, ACR_SERVICE), self._url)

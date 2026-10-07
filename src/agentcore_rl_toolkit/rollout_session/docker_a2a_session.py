@@ -26,15 +26,15 @@ class DockerA2ASession(A2ARolloutSession):
         session_state: PersistentDict,
         *,
         agent_image_uri: str,
-        iam_role_arn: str,
-        log_group: str,
-        log_region: str,
+        docker_iam_role_arn: str,
+        docker_log_group: str,
+        docker_log_region: str,
     ):
         super().__init__(session_id, session_state)
         self.agent_image_uri = agent_image_uri
-        self.iam_role_arn = iam_role_arn
-        self.log_group = log_group
-        self.log_region = log_region
+        self.iam_role_arn = docker_iam_role_arn
+        self.log_group = docker_log_group
+        self.log_region = docker_log_region
 
         # Set once `docker run` succeeds so shutdown skips a container that never started.
         self._running = False

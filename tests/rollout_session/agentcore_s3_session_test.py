@@ -148,7 +148,14 @@ def state(session_id: str = SESSION_ID) -> PersistentDict:
 
 
 def make(client: FakeClient, session_id: str = SESSION_ID) -> AgentCoreS3Session:
-    return AgentCoreS3Session(session_id, state(session_id), client=client)  # type: ignore[arg-type]
+    with mock.patch.object(mod, "get_or_create_rollout_client", return_value=client):
+        return AgentCoreS3Session(
+            session_id,
+            state(session_id),
+            agentcore_runtime_arn=RUNTIME_ARN,
+            rollout_output_s3=BUCKET,
+            experiment_name="exp-1",
+        )
 
 
 async def run_rollout(client: FakeClient, task_dict: dict | None = None):
@@ -552,7 +559,7 @@ class ClientCacheTest(unittest.TestCase):
 
 
 class FactoryTest(unittest.TestCase):
-    """``backend: agentcore_s3`` reaches this session, with its config applied."""
+    """``backend`` naming this class reaches it, with its config applied."""
 
     def setUp(self):
         mod.reset_client_cache()
@@ -563,7 +570,7 @@ class FactoryTest(unittest.TestCase):
 
     def session(self, **overrides):
         config = {
-            "backend": "agentcore_s3",
+            "backend": "agentcore_rl_toolkit.rollout_session.agentcore_s3_session.AgentCoreS3Session",
             "agentcore_runtime_arn": RUNTIME_ARN,
             "rollout_output_s3": f"s3://{BUCKET}/runs",
             "experiment_name": "exp-1",
@@ -587,10 +594,10 @@ class FactoryTest(unittest.TestCase):
         session = self.session(max_pool_connections=512)
         self.assertEqual(session._client.kwargs["max_pool_connections"], 512)
 
-    def test_an_unknown_backend_names_the_ones_that_exist(self):
+    def test_a_missing_key_is_named(self):
         with self.assertRaises(ValueError) as caught:
-            self.session(backend="nope")
-        self.assertIn("agentcore_s3", str(caught.exception))
+            self.session(experiment_name=None)
+        self.assertIn("experiment_name", str(caught.exception))
 
 
 if __name__ == "__main__":

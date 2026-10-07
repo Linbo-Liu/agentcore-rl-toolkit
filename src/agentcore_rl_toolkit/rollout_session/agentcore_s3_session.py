@@ -135,8 +135,17 @@ class AgentCoreS3Session(RolloutSession):
         session_id: str,
         session_state: PersistentDict,
         *,
-        client: RolloutClient,
+        agentcore_runtime_arn: str,
+        rollout_output_s3: str,
+        experiment_name: str,
+        max_pool_connections: int = 100,
     ):
+        client = get_or_create_rollout_client(
+            agentcore_runtime_arn=agentcore_runtime_arn,
+            rollout_output_s3=rollout_output_s3,
+            experiment_name=experiment_name,
+            max_pool_connections=max_pool_connections,
+        )
         if len(session_id) < MIN_ACR_SESSION_ID_LEN:
             raise ValueError(
                 f"session_id={session_id!r} is {len(session_id)} characters; ACR requires a "
