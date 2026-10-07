@@ -1,4 +1,4 @@
-"""Shared fixtures for the experimental slime backend tests.
+"""Shared fixtures for the slime backend tests.
 
 Slime is not a declared dev dependency (it requires a full CUDA-13 training
 stack), so the rollout module is tested by injecting fake slime modules into

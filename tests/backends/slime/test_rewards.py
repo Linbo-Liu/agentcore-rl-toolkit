@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agentcore_rl_toolkit.backends.experimental.slime.integration.rewards import normalize_episode_rewards
+from agentcore_rl_toolkit.backends.slime.integration.rewards import normalize_episode_rewards
 
 
 def _args(estimator="grpo", normalization=True, std=False):

@@ -17,8 +17,8 @@ HF rendering behind the :class:`Renderer` protocol:
   tool parser — each independently overridable via ``reasoning_parser`` /
   ``tool_parser`` and each defaulting to the dependency-free implementation
   (``</think>`` split / ``<tool_call><function=...>`` regex). Passing either stage
-  parser disables schema detection: explicit injection (e.g. slime supplying SGLang's
-  detectors) always wins. Tool-bearing requests with no matched schema and no
+  parser disables schema detection: explicit injection (e.g. a trainer supplying its
+  engine's detectors) always wins. Tool-bearing requests with no matched schema and no
   injected ``tool_parser`` are rejected rather than guessed at. Needs only
   ``transformers``.
 """
@@ -127,8 +127,7 @@ class HfTemplateRenderer:
         an explicit opt-in (``tool_parser=parse_tool_uses``).
 
       Passing either parser disables schema detection entirely: explicit injection
-      always wins (see ``backends.slime.integration.sglang_parsing``, which supplies
-      SGLang's detectors without this package importing an engine).
+      always wins.
     """
 
     def __init__(

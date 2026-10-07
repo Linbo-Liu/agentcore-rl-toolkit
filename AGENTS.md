@@ -34,7 +34,7 @@ cd examples/strands_math_agent && uv sync && uv run python rl_app.py
 | `src/agentcore_rl_toolkit/rollout_gateway/` | In-repo token-level trajectory capture layer: `RolloutGateway`, `Renderer`, `SamplingBackend`, `TraceRecord` (see [Rollout Gateway](#rollout-gateway)) |
 | `src/agentcore_rl_toolkit/backends/verl/` | verl backend: `AgentCoreAgentLoop` plugged into verl's standard main_ppo entrypoint via the rollout gateway |
 | `src/agentcore_rl_toolkit/backends/tinker_api/` | CPU training loop over a Tinker-compatible endpoint, with HF rendering and synchronous group-relative updates |
-| `src/agentcore_rl_toolkit/backends/experimental/slime/` | Experimental slime backend: `generate` + `normalize_episode_rewards` hooks for slime's `--custom-generate-function-path` / `--custom-reward-post-process-path` (see [Experimental slime backend](#experimental-slime-backend-backendsexperimentalslime)) |
+| `src/agentcore_rl_toolkit/backends/slime/` | slime backend: `generate` + `normalize_episode_rewards` hooks for slime's `--custom-generate-function-path` / `--custom-reward-post-process-path` (see [slime backend](#slime-backend-backendsslime)) |
 | `src/agentcore_rl_toolkit/sandbox/` | Sandbox SDK: `SandboxClient`, `Sandbox`, `ExecResult` — run programs in arbitrary images on ACR (see [Sandbox SDK](#sandbox-sdk)) |
 | `sandboxd/` | Go daemon (`agentcore-sandboxd`) for session health and recoverable command execution |
 | `examples/strands_math_agent/` | GSM8K math agent example |
@@ -197,13 +197,8 @@ drains the tree into `list[TraceRecord]`.
   would silently miss every other; opt into it explicitly with
   `tool_parser=parse_tool_uses`); the gateway itself never imports an inference
   engine. Injecting a `reasoning_parser` / `tool_parser` callable into
-  `HfTemplateRenderer` disables schema detection and takes full control. The slime backend injects parsers built from
-  SGLang's own detectors (`backends/slime/integration/sglang_parsing.py`, composing
-  `FunctionCallParser` + `ReasoningParser`) wired from slime's
-  `--sglang-tool-call-parser` / `--sglang-reasoning-parser` args (names must match the
-  served model); sglang is always importable there because the trainer serves SGLang.
-  The experimental slime backend (`backends/experimental/slime/`) instead uses the default
-  schema-based parsing (`HfTemplateRenderer` with no custom parsers); injecting the same
+  `HfTemplateRenderer` disables schema detection and takes full control. The slime
+  backend (`backends/slime/`) uses the default schema-based parsing (`HfTemplateRenderer` with no custom parsers); injecting the same
   SGLang-native parsers via the `reasoning_parser` / `tool_parser` kwargs is a natural
   extension if tool-bearing or reasoning-bearing models are served.
 - For Tinker API training (`backends/tinker_api/`), install `[gateway,tinker_api]`
@@ -219,8 +214,8 @@ importing the package never requires aiohttp. Tests live in `tests/rollout_gatew
 
 **Status.** The capture layer above is implemented and tested. Training-backend consumers:
 the **verl backend** (`backends/verl/`, see below), the **Tinker API backend**
-(`backends/tinker_api/`), and the **experimental slime backend**
-(`backends/experimental/slime/`, see below). Other
+(`backends/tinker_api/`), and the **slime backend**
+(`backends/slime/`, see below). Other
 backends' dispatch/reward-join glue is not yet on the main branch — a prototype
 dispatcher is parked on the `wip/online-rl-dispatch` branch.
 
@@ -242,13 +237,13 @@ sha256 hashes of the covered chat templates — preserving the marked local-addi
 block at the end of `_TEMPLATE_HASHES` (templates with no TRL equivalent, e.g.
 Qwen3-Coder → `qwen3_5`). Bump the baseline commit here when you re-sync.
 
-### Experimental slime backend (`backends/experimental/slime/`)
+### slime backend (`backends/slime/`)
 
 Plugs into [slime](https://github.com/THUDM/slime) (Megatron-LM + SGLang GRPO trainer)
 via two hook entry points, requiring no changes to slime itself:
 
-- `--custom-generate-function-path agentcore_rl_toolkit.backends.experimental.slime.integration.rollout.generate`
-- `--custom-reward-post-process-path agentcore_rl_toolkit.backends.experimental.slime.integration.rewards.normalize_episode_rewards`
+- `--custom-generate-function-path agentcore_rl_toolkit.backends.slime.integration.rollout.generate`
+- `--custom-reward-post-process-path agentcore_rl_toolkit.backends.slime.integration.rewards.normalize_episode_rewards`
 - `--custom-config-path /path/to/config.yaml` (see `examples/math_agent/config.yaml.example`)
 
 **Key pieces:**
@@ -281,7 +276,7 @@ for the positional advantage estimator; the actual agent input lives in `metadat
 **Installation.**
 
 ```bash
-bash src/agentcore_rl_toolkit/backends/experimental/slime/scripts/install_slime.sh
+bash src/agentcore_rl_toolkit/backends/slime/scripts/install_slime.sh
 ```
 
 Requires CUDA 13 (`CUDA_HOME=/usr/local/cuda-13.0`). The script installs: cu13 PyTorch +
@@ -291,7 +286,7 @@ nvidia-modelopt, sglang, and clones + installs slime + Megatron-LM from source.
 **Running (GSM8K example).**
 
 ```bash
-cd src/agentcore_rl_toolkit/backends/experimental/slime/examples/math_agent
+cd src/agentcore_rl_toolkit/backends/slime/examples/math_agent
 cp config.yaml.example config.yaml  # fill in agent_runtime_arn + s3_bucket
 SLIME_DIR=... MODEL_DIR=... TRAIN_DATA_PATH=... MODEL_TYPE=... bash train.sh
 ```

@@ -28,8 +28,8 @@ python rl_app.py
 
 Deploy via the
 [Prepare agent for RL → Deploy](/agentcore-rl-toolkit/guides/agent-adaptation/)
-flow, then evaluate with `evaluate.py` or train with
-[`SlimeRunner`](/agentcore-rl-toolkit/guides/slime-backend-setup/).
+flow, then evaluate with `evaluate.py` or train with the
+[slime backend](/agentcore-rl-toolkit/guides/slime-backend-setup/).
 
 ## What's in the example
 

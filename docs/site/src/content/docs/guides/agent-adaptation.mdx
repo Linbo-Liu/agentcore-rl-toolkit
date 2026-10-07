@@ -138,15 +138,11 @@ A successful deploy prints the **agent runtime ARN** — that's the
 one thing the training backend needs to reach this agent. Pair it
 with your **S3 bucket name** (where rewards will land) and you have
 the full set of hand-off values for the training backend. For example, they drop directly
-into `SlimeRunner` (from
-`agentcore_rl_toolkit.backends.slime.SlimeRunner`):
+into the slime backend's hook config:
 
-```python
-SlimeRunner(
-    agent_runtime_arn="arn:aws:bedrock-agentcore:us-west-2:...",
-    s3_bucket="your-bucket-name",
-    ...,
-).train(...)
+```yaml
+agent_runtime_arn: "arn:aws:bedrock-agentcore:us-west-2:..."
+s3_bucket: "your-bucket-name"
 ```
 
 :::note[Notes]
