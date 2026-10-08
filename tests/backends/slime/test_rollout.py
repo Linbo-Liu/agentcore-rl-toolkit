@@ -1,4 +1,4 @@
-"""Unit tests for the experimental slime rollout helpers.
+"""Unit tests for the slime rollout helpers.
 
 Covers AgentCoreRLConfig.from_args, _build_payload, _agent_reward,
 _aborted, and _to_sample.  Slime is replaced by a fake module (see
@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agentcore_rl_toolkit.backends.experimental.slime.integration import rollout
+from agentcore_rl_toolkit.backends.slime.integration import rollout
 from agentcore_rl_toolkit.rollout_gateway.trace import Status as TraceStatus
 from agentcore_rl_toolkit.rollout_gateway.trace import TraceRecord
 

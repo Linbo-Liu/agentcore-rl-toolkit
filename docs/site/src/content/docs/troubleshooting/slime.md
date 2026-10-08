@@ -27,6 +27,7 @@ was validated against:
 **Qwen2.5-32B-Instruct** uses `1e-6`.
 
 **Fix:** Edit the slime model script to `--norm-epsilon 1e-6`, or
-pass an override through `SlimeRunner(extra_flags=["--norm-epsilon", "1e-6"])`.
+append `--norm-epsilon 1e-6` to the `train.py` arguments in your
+`train.sh` (later flags override `MODEL_ARGS`).
 Qwen2.5-0.5B / 1.5B / 3B / 7B Instruct variants match their base-model
 norm epsilons, so this only affects Qwen2.5-32B.

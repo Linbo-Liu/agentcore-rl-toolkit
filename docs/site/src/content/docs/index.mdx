@@ -57,16 +57,16 @@ hero:
       <span class="ln"><span style="color:#6a9955"># → arn:aws:bedrock-agentcore:us-west-2:...</span></span></code></pre>
         </div>
         <div class="hero-step-panel" data-panel="3">
-          <pre class="hero-code"><code><span class="ln"><span style="color:#c586c0">from</span> agentcore_rl_toolkit.backends.slime <span style="color:#c586c0">import</span> <span style="color:#4ec9b0">SlimeRunner</span></span>
+          <pre class="hero-code"><code><span class="ln"><span style="color:#6a9955"># config.yaml</span></span>
+      <span class="ln">agent_runtime_arn: <span style="color:#ce9178">"arn:aws:bedrock-agentcore:..."</span></span>
+      <span class="ln">s3_bucket: <span style="color:#ce9178">"my-bucket"</span></span>
       <span class="ln"></span>
-      <span class="ln"><span style="color:#4ec9b0">SlimeRunner</span>(</span>
-      <span class="ln">    exp_id=<span style="color:#ce9178">"gsm8k-3b"</span>,</span>
-      <span class="ln">    agent_runtime_arn=<span style="color:#ce9178">"arn:aws:bedrock-agentcore:..."</span>,</span>
-      <span class="ln">    s3_bucket=<span style="color:#ce9178">"my-bucket"</span>,</span>
-      <span class="ln">    model_dir=<span style="color:#ce9178">"/path/to/Qwen2.5-3B-Instruct"</span>,</span>
-      <span class="ln">    data_path=<span style="color:#ce9178">"/path/to/gsm8k.jsonl"</span>,</span>
-      <span class="ln">    model_type=<span style="color:#ce9178">"qwen2.5-3B"</span>,</span>
-      <span class="ln">).train()</span></code></pre>
+      <span class="ln"><span style="color:#6a9955"># Launch slime with the AgentCore rollout hooks</span></span>
+      <span class="ln">SLIME_DIR=/path/to/slime \</span>
+      <span class="ln">MODEL_DIR=/path/to/Qwen3-0.6B \</span>
+      <span class="ln">TRAIN_DATA_PATH=/path/to/gsm8k.jsonl \</span>
+      <span class="ln">MODEL_TYPE=qwen3-0.6B \</span>
+      <span class="ln">bash train.sh</span></code></pre>
         </div>
       </div>
       <script>

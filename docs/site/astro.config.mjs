@@ -91,15 +91,6 @@ export default defineConfig({
 							label: 'Core',
 							items: [{ autogenerate: { directory: 'api/core' } }],
 						},
-						{
-							label: 'Backends',
-							items: [
-								{
-									label: 'slime',
-									items: [{ autogenerate: { directory: 'api/backends/slime' } }],
-								},
-							],
-						},
 					],
 				},
 				{

@@ -18,9 +18,6 @@ Output structure:
         app.md
         client.md
         reward.md
-      backends/
-        slime/
-          runner.md
 """
 from __future__ import annotations
 
@@ -50,7 +47,7 @@ class ModuleSpec:
     """
 
     dotted_paths: tuple[str, ...]  # one or more dotted module paths
-    out_path: str  # relative to OUT_DIR, e.g. "backends/slime/runner.md"
+    out_path: str  # relative to OUT_DIR, e.g. "core/app.md"
     title: str
     description: str
     # Allowlist of top-level symbol names to emit. None = everything
@@ -90,18 +87,6 @@ MODULES: list[ModuleSpec] = [
         title="reward",
         description="RewardFunction base class.",
         include=("RewardFunction",),
-    ),
-    # --- Backends › slime --- #
-    # Only the public user surface: the SlimeRunner entry point.
-    # integration/rollout.py and integration/rewards.py are load-bearing
-    # plugin paths but users don't import them — SlimeRunner wires them
-    # into the job.
-    ModuleSpec(
-        dotted_paths=("agentcore_rl_toolkit.backends.slime.runner",),
-        out_path="backends/slime/runner.md",
-        title="SlimeRunner",
-        description="One Python entry point for slime-backed training.",
-        include=("SlimeRunner",),
     ),
 ]
 
