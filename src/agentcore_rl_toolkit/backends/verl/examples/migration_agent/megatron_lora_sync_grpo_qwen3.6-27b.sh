@@ -5,6 +5,7 @@
 set -x
 
 export HYDRA_FULL_ERROR=1
+export VERL_USE_EXTERNAL_MODULES=agentcore_rl_toolkit.backends.verl.trainer
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 AGENT_LOOP_CONFIG=$SCRIPT_DIR/agentcore_agent.yaml
@@ -36,7 +37,7 @@ CKPTS_DIR=${CKPTS_DIR:-checkpoints/${PROJECT_NAME}/${EXPERIMENT_NAME}}
 
 python3 -m verl.trainer.main_ppo \
     --config-name ppo_megatron_trainer \
-    trainer.v1.trainer_mode=sync \
+    trainer.v1.trainer_mode=agentcore_sync \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=true \
     algorithm.use_kl_in_reward=False \
@@ -75,6 +76,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.megatron.override_transformer_config.recompute_granularity=full \
     actor_rollout_ref.actor.megatron.override_transformer_config.recompute_method=uniform \
     actor_rollout_ref.actor.megatron.override_transformer_config.recompute_num_layers=1 \
+    ++actor_rollout_ref.actor.megatron.override_transformer_config.gradient_accumulation_fusion=False \
     actor_rollout_ref.actor.megatron.param_offload=false \
     actor_rollout_ref.actor.megatron.grad_offload=true \
     actor_rollout_ref.actor.megatron.optimizer_offload=true \
