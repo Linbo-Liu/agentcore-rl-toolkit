@@ -42,12 +42,23 @@ export default defineConfig({
 					items: [
 						{ label: 'Prepare agent for RL', slug: 'guides/agent-adaptation' },
 						{
-							label: 'Training backends',
+							label: 'Training Backends',
 							items: [
-								{ label: 'slime', slug: 'guides/slime-backend-setup' },
-								{ label: 'rllm', slug: 'guides/rllm-backend-setup' },
 								{ label: 'verl', slug: 'guides/verl-backend-setup' },
+								{ label: 'slime', slug: 'guides/slime-backend-setup' },
 								{ label: 'SageMaker', slug: 'guides/sagemaker-backend-setup' },
+								{
+									label: 'SkyRL ↗',
+									link: 'https://github.com/awslabs/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/tinker_api/README.md',
+								},
+								{
+									label: 'Tinker ↗',
+									link: 'https://github.com/awslabs/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/backends/tinker_api/README.md',
+								},
+								{
+									label: 'rLLM ↗',
+									link: 'https://docs.rllm-project.com/agent-runtimes/agentcore',
+								},
 							],
 						},
 					],
@@ -56,15 +67,11 @@ export default defineConfig({
 					label: 'Examples',
 					items: [
 						{ label: 'Overview', slug: 'examples' },
-						{
-							label: 'Strands Agents on AgentCore',
-							items: [
-								{ label: 'Math', slug: 'examples/strands-math-agent' },
-								{ label: 'AppWorld', slug: 'examples/strands-appworld-agent' },
-								{ label: 'MigrationBench', slug: 'examples/strands-migration-agent' },
-								{ label: 'OfficeBench', slug: 'examples/strands-officebench-agent' },
-							],
-						},
+						{ label: 'Math (GSM8K)', slug: 'examples/strands-math-agent' },
+						{ label: 'AppWorld', slug: 'examples/strands-appworld-agent' },
+						{ label: 'MigrationBench', slug: 'examples/strands-migration-agent' },
+						{ label: 'OfficeBench', slug: 'examples/strands-officebench-agent' },
+						{ label: 'SWE-Gym', slug: 'examples/openhands-swegym-agent' },
 					],
 				},
 				{
@@ -75,6 +82,18 @@ export default defineConfig({
 							label: 'Training multi-step agents with RL',
 							slug: 'blog/training-multi-step-agents-rl',
 						},
+						{
+							label: 'Growing verifiable training data',
+							slug: 'blog/data-synthesis-v0',
+						},
+						{
+							label: 'Stable Updates, Fewer Sequences',
+							slug: 'blog/variable-rows-linear-mode',
+						},
+						{
+							label: 'Async RL performance optimization',
+							slug: 'blog/async-rl-performance-optimization',
+						},
 					],
 				},
 				{
@@ -82,16 +101,7 @@ export default defineConfig({
 					items: [
 						{
 							label: 'Core',
-							autogenerate: { directory: 'api/core' },
-						},
-						{
-							label: 'Backends',
-							items: [
-								{
-									label: 'slime',
-									autogenerate: { directory: 'api/backends/slime' },
-								},
-							],
+							items: [{ autogenerate: { directory: 'api/core' } }],
 						},
 					],
 				},
@@ -99,7 +109,7 @@ export default defineConfig({
 					label: 'Troubleshooting',
 					items: [
 						{
-							label: 'Training backends',
+							label: 'Training Backends',
 							items: [
 								{ label: 'slime', slug: 'troubleshooting/slime' },
 							],

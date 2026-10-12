@@ -57,16 +57,16 @@ hero:
       <span class="ln"><span style="color:#6a9955"># → arn:aws:bedrock-agentcore:us-west-2:...</span></span></code></pre>
         </div>
         <div class="hero-step-panel" data-panel="3">
-          <pre class="hero-code"><code><span class="ln"><span style="color:#c586c0">from</span> agentcore_rl_toolkit.backends.slime <span style="color:#c586c0">import</span> <span style="color:#4ec9b0">SlimeRunner</span></span>
+          <pre class="hero-code"><code><span class="ln"><span style="color:#6a9955"># config.yaml</span></span>
+      <span class="ln">agent_runtime_arn: <span style="color:#ce9178">"arn:aws:bedrock-agentcore:..."</span></span>
+      <span class="ln">s3_bucket: <span style="color:#ce9178">"my-bucket"</span></span>
       <span class="ln"></span>
-      <span class="ln"><span style="color:#4ec9b0">SlimeRunner</span>(</span>
-      <span class="ln">    exp_id=<span style="color:#ce9178">"gsm8k-3b"</span>,</span>
-      <span class="ln">    agent_runtime_arn=<span style="color:#ce9178">"arn:aws:bedrock-agentcore:..."</span>,</span>
-      <span class="ln">    s3_bucket=<span style="color:#ce9178">"my-bucket"</span>,</span>
-      <span class="ln">    model_dir=<span style="color:#ce9178">"/path/to/Qwen2.5-3B-Instruct"</span>,</span>
-      <span class="ln">    data_path=<span style="color:#ce9178">"/path/to/gsm8k.jsonl"</span>,</span>
-      <span class="ln">    model_type=<span style="color:#ce9178">"qwen2.5-3B"</span>,</span>
-      <span class="ln">).train()</span></code></pre>
+      <span class="ln"><span style="color:#6a9955"># Launch slime with the AgentCore rollout hooks</span></span>
+      <span class="ln">SLIME_DIR=/path/to/slime \</span>
+      <span class="ln">MODEL_DIR=/path/to/Qwen3-0.6B \</span>
+      <span class="ln">TRAIN_DATA_PATH=/path/to/gsm8k.jsonl \</span>
+      <span class="ln">MODEL_TYPE=qwen3-0.6B \</span>
+      <span class="ln">bash train.sh</span></code></pre>
         </div>
       </div>
       <script>
@@ -104,14 +104,10 @@ hero:
 
 **Isolated, auto-scaling rollouts** — every rollout runs in its own [AgentCore Runtime](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agents-tools-runtime.html) microVM with its own dependencies; thousands in parallel without contending for your machine.
 
-**Framework-agnostic training** — works with verl, rllm, or slime; `model-gateway` captures token IDs, logprobs, and expert masks transparently while the agent keeps its original chat interface.
+**Flexible training integrations** — use verl, slime, SkyRL, or Tinker with ART's rollout gateway for token IDs, logprobs, and loss masks. [rLLM natively integrates with AgentCore Runtime](https://docs.rllm-project.com/agent-runtimes/agentcore).
 
-**Any agent framework** — [Strands](https://strandsagents.com/), [LangGraph](https://langchain-ai.github.io/langgraph/), or custom. The agent's runtime is independent of the training library.
+**Any agent framework** — [Strands](https://strandsagents.com/), [LangGraph](https://langchain-ai.github.io/langgraph/), [OpenHands](https://openhands.dev), and more. The agent's runtime is independent of the training library.
 
 New here? Start with the [math agent example](/agentcore-rl-toolkit/examples/strands-math-agent/)
 or read the [overview](/agentcore-rl-toolkit/guides/overview/). Already have an agent?
-Jump straight to [prepare agent for RL](/agentcore-rl-toolkit/guides/agent-adaptation/) and
-Kick off RL with any training backend: [slime](/agentcore-rl-toolkit/guides/slime-backend-setup/) ·
-[rllm](/agentcore-rl-toolkit/guides/rllm-backend-setup/) ·
-[verl](/agentcore-rl-toolkit/guides/verl-backend-setup/) ·
-[SageMaker](/agentcore-rl-toolkit/guides/sagemaker-backend-setup/).
+Choose a setup guide from [Training Backends](/agentcore-rl-toolkit/guides/overview/#training-backends).

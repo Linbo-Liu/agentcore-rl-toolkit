@@ -8,7 +8,7 @@ The problem it removes: each turn the client replays the whole conversation as m
 re-rendering a prior assistant message from its parsed dict rarely reproduces the exact
 token ids the model actually generated (whitespace, tool-call JSON spacing, reasoning
 re-keying). The :class:`~.trajectory.TrajectoryManager` then sees that drift and FORKs the
-single rollout into multiple training samples (or REALIGNs and drops a turn's signal).
+single rollout into multiple training samples.
 
 The fix: because the gateway owns the tokens handed to the backend, it substitutes the
 exact ids it already served for the earlier turns **before** generation, so the model
@@ -24,7 +24,7 @@ Per turn the healer holds, per sid:
 * ``prev_messages`` / ``prev_tools`` — the message list (including the generated assistant)
   and tools schema last rendered, used to re-derive the drifted skeleton.
 
-Healing ``messages`` for the next turn (:meth:`heal`):
+Healing ``messages`` for the next turn (``await heal(...)``):
 
 1. Linearity check at the **message level**: ``prev_messages`` must be a prefix of the
    incoming ``messages`` under dict equality (``==``, which is order-independent), and the
@@ -35,16 +35,18 @@ Healing ``messages`` for the next turn (:meth:`heal`):
    equal and stays linear. Only a genuine edit/drop/branch/compaction (or a tools change)
    is non-linear — handled per ``on_nonlinear``. ``new = messages[len(prev_messages):]``
    is the genuinely-new observation(s).
-2. ``r_prev = render(prev_messages, add_generation_prompt=False)`` — the prior conversation
+2. If the renderer supports ``render_delta``, render the real stored history and its
+   extension to text, probe the assistant closer in text, and encode only the closer
+   and the new tail. If that path is unavailable or declines, use steps 3–5 below.
+3. ``r_prev = render(prev_messages, add_generation_prompt=False)`` — the prior conversation
    rendered from the gateway's OWN stored messages (``= served_prompt' + O_n' + close_n``).
-3. ``r_ext = render(prev_messages + new, add_generation_prompt=True)`` — the same stored
-   prefix extended by the new observation(s). ``r_ext`` starts with ``r_prev`` **by
-   construction** (same prefix list, same tools), so the client's re-serialization of prior
-   turns never enters the fed tokens.
-4. ``close_n`` — the template's assistant-closer after the last turn, extracted exactly by
+4. ``r_ext = render(prev_messages + new, add_generation_prompt=True)`` — the same stored
+   prefix extended by the new observation(s). Check that ``r_ext`` starts with ``r_prev``;
+   the client's re-serialization of prior turns never enters the fed tokens.
+5. ``close_n`` — the template's assistant-closer after the last turn, extracted by
    a common-suffix probe (:func:`_assistant_close`), independent of template internals.
-5. ``healed = served_prefix + close_n + r_ext[len(r_prev):]`` — canonical prefix, the
-   template close, then the genuinely-new observation + generation-prompt tail.
+6. Splice the closer and new tail onto ``served_prefix``, omitting any closer tokens
+   already present at the end of the served prefix.
 
 :meth:`commit` (after a successful turn) advances ``served_prefix`` to
 ``healed + output_ids`` and ``prev_messages`` to ``messages + [response_message]``.
@@ -58,17 +60,11 @@ import dataclasses
 import logging
 from collections import Counter
 
-from .render import Renderer
+from .render import _PROBE_A, _PROBE_B, Renderer, _common_suffix
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["LinearHealer"]
-
-# two clearly-distinct assistant bodies used to probe the template's between-message glue
-# (see _assistant_close). They must tokenize to different trailing tokens so the common
-# suffix of the two renders is exactly the closer, nothing of the body.
-_PROBE_A = "linprobe body alpha 00000"
-_PROBE_B = "linprobe body omega 99999"
 
 
 def _common_prefix_len(a: list[int], b: list[int]) -> int:
@@ -77,15 +73,6 @@ def _common_prefix_len(a: list[int], b: list[int]) -> int:
     while i < limit and a[i] == b[i]:
         i += 1
     return i
-
-
-def _common_suffix(a: list[int], b: list[int]) -> list[int]:
-    """The longest common suffix of two id lists (as a fresh list)."""
-    limit = min(len(a), len(b))
-    i = 0
-    while i < limit and a[-1 - i] == b[-1 - i]:
-        i += 1
-    return a[len(a) - i :] if i else []
 
 
 @dataclasses.dataclass
@@ -131,7 +118,7 @@ class LinearHealer:
 
     # -- public -------------------------------------------------------------
 
-    def heal(self, sid: str, messages: list[dict], tools: list[dict] | None) -> list[int]:
+    async def heal(self, sid: str, messages: list[dict], tools: list[dict] | None) -> list[int]:
         """Return the token ids to feed the backend for this turn.
 
         For the first turn of a sid (or a passthrough sid) this is just the plain render;
@@ -147,7 +134,7 @@ class LinearHealer:
         st = self._state.get(sid)
         if st is None or sid in self._disabled:
             # first turn, or healing disabled for this sid: feed the plain render
-            return self.renderer.render(messages, tools=tools, add_generation_prompt=True)
+            return await self.renderer.render(messages, tools=tools, add_generation_prompt=True)
 
         # Linearity is decided in MESSAGE space, not token space. st.prev_messages is this
         # session's history before this request (including the last assistant message). The
@@ -160,36 +147,42 @@ class LinearHealer:
         new = self._linear_delta(st, messages, tools)
         if new is None:
             # genuine edit/drop/branch/compaction (or a tools change): re-anchor
-            r_full = self.renderer.render(messages, tools=tools, add_generation_prompt=True)
+            r_full = await self.renderer.render(messages, tools=tools, add_generation_prompt=True)
             return self._handle_nonlinear(sid, r_full)
+
+        render_delta = getattr(self.renderer, "render_delta", None)
+        if render_delta is not None:
+            delta = await render_delta(st.prev_messages, new, tools=st.prev_tools)
+            if delta is not None:
+                close, tail = delta
+                return self._splice(sid, st, close, tail)
 
         # r_prev is the token-space render of the gateway's OWN stored history. r_ext extends
         # that same stored prefix by only the genuinely-new (non-assistant, drift-free)
         # messages, so r_ext starts with r_prev by construction (identical prefix list and
         # tools) -- the client's re-serialized prior turns never enter the fed tokens.
-        r_prev = self.renderer.render(st.prev_messages, tools=st.prev_tools, add_generation_prompt=False)
-        r_ext = self.renderer.render(st.prev_messages + new, tools=st.prev_tools, add_generation_prompt=True)
+        r_prev = await self.renderer.render(st.prev_messages, tools=st.prev_tools, add_generation_prompt=False)
+        r_ext = await self.renderer.render(st.prev_messages + new, tools=st.prev_tools, add_generation_prompt=True)
         if r_ext[: len(r_prev)] != r_prev:
             # template glue for the prior turns depends on the appended messages, so we
             # cannot splice the canonical prefix safely; re-anchor rather than emit garbage.
             return self._handle_nonlinear(sid, r_ext)
 
         # close is the token-space marker of the end of the assistant turn
-        close = self._assistant_close(st.prev_messages, st.prev_tools, r_prev)
+        close = await self._assistant_close(st.prev_messages, st.prev_tools, r_prev)
         if close is None:
             # couldn't isolate the assistant-closer (e.g. a template whose glue depends on
             # message type); don't emit a subtly-wrong sequence — fall back.
             self._bump(sid, "close_unresolved")
             return self._handle_nonlinear(sid, r_ext)
 
+        return self._splice(sid, st, close, r_ext[len(r_prev) :])
+
+    def _splice(self, sid: str, st: _State, close: list[int], tail: list[int]) -> list[int]:
         # don't duplicate close tokens the model already emitted at the end of its served
         # output (e.g. a trailing stop token kept by no_stop_trim): drop the prefix of
         # `close` that the served prefix already ends with.
         close = self._trim_overlap(st.served_prefix, close)
-
-        # tail is the token representation of the new messages in the incoming request
-        # these are not assistant messages, so they are masked and drift-free
-        tail = r_ext[len(r_prev) :]  # new observation messages + generation prompt
 
         self._bump(sid, "healed_turns")
         self._bump(sid, "healed_prefix_tokens", len(st.served_prefix) + len(close))
@@ -283,7 +276,7 @@ class LinearHealer:
         logger.info("linear healer: sid=%s non-linear jump; re-anchoring", sid)
         return r_full
 
-    def _assistant_close(
+    async def _assistant_close(
         self, prev_messages: list[dict], tools: list[dict] | None, r_prev: list[int]
     ) -> list[int] | None:
         """The template's between-message glue that follows the last assistant message
@@ -302,10 +295,10 @@ class LinearHealer:
         emit a wrong boundary.
         """
         before = prev_messages[:-1]
-        ra = self.renderer.render(
+        ra = await self.renderer.render(
             before + [{"role": "assistant", "content": _PROBE_A}], tools=tools, add_generation_prompt=False
         )
-        rb = self.renderer.render(
+        rb = await self.renderer.render(
             before + [{"role": "assistant", "content": _PROBE_B}], tools=tools, add_generation_prompt=False
         )
         close = _common_suffix(ra, rb)

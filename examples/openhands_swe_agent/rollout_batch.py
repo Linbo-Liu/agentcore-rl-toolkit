@@ -24,13 +24,13 @@ from agentcore_rl_toolkit.aws_tools.persistent_dict import DynamoDBPersister, Pe
 from agentcore_rl_toolkit.aws_tools.s3_tools import upload_object
 from agentcore_rl_toolkit.concurrency.priority_assigner import LocalPriorityAssigner
 from agentcore_rl_toolkit.concurrency.priority_semaphore import LocalPrioritySemaphore
-from agentcore_rl_toolkit.concurrency.rate_limiter import ACRRateLimiter
+from agentcore_rl_toolkit.concurrency.rate_limiter import LocalRateLimiter
 
 # BaseTrace/TraceRecord are torch-free and aiohttp-free; the heavy gateway pieces are
 # imported lazily in VllmGatewayEndpoint.start() so a Bedrock-only run stays light.
 from agentcore_rl_toolkit.rollout_gateway import BaseTrace, TraceRecord
-from agentcore_rl_toolkit.rollout_session.agentcore_session import AgentCoreSession
-from agentcore_rl_toolkit.rollout_session.exception_utils import exception_to_string
+from agentcore_rl_toolkit.rollout_session.exception_utils import describe_with_root_cause, exception_to_string
+from agentcore_rl_toolkit.rollout_session.factory import make_session
 from agentcore_rl_toolkit.rollout_session.lifecycle import (
     RolloutSession,
     RolloutSessionBounds,
@@ -148,7 +148,7 @@ def bedrock_token(region: str) -> str:
 
 
 @dataclasses.dataclass
-class BedrockEndpoint:
+class BedrockMantleEndpoint:
     """The agent talks straight to Bedrock -- no gateway, no token capture.
 
     ``model`` is a LiteLLM model id whose ``openai/`` prefix routes at ``base_url``.
@@ -178,6 +178,45 @@ class BedrockEndpoint:
             api_key=bedrock_token(self.region),
             temperature=temperature,
             top_p=top_p,
+        )
+
+    def open_session(self, session_id: str, sampling_params: dict) -> None:
+        pass
+
+    async def finish_session(self, session_id: str) -> list[TraceRecord]:
+        return []
+
+
+@dataclasses.dataclass
+class BedrockConverseEndpoint:
+    """The agent talks straight to Bedrock's native Converse API.
+    ``model`` is a Bedrock model or inference-profile id
+    (e.g. ``global.anthropic.claude-sonnet-5``); LiteLLM's bedrock ``converse/`` route
+    signs with a bearer token in the ``api_key`` slot instead of SigV4.
+    """
+
+    model: str
+    region: str
+    kind: str = "bedrock_converse"
+
+    def label(self) -> str:
+        return f"bedrock-converse-{self.region}"
+
+    def captures_tokens(self) -> bool:
+        return False
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+    def build_task_llm(self, session_id: str, temperature: float, top_p: float) -> dict:
+        return dict(
+            model=f"bedrock/converse/{self.model}",
+            aws_region_name=self.region,
+            api_key=bedrock_token(self.region),
+            requestMetadata={"session_id": session_id},
         )
 
     def open_session(self, session_id: str, sampling_params: dict) -> None:
@@ -230,7 +269,6 @@ class VllmGatewayEndpoint:
             tokenizer=tokenizer,
             adapters=["openai"],
             max_turns_per_sid=1000,
-            fork_threshold_tokens=0,
         )
         server = ThreadedGatewayServer(gateway, host=self.host, port=0)
         server.start()
@@ -282,7 +320,8 @@ class EvalConfig:
     """One evaluation run: a (dataset slice, endpoint, sampling, concurrency) point.
 
     ``dataset`` is a parquet whose rows are tasks in the schema training reads;
-    ``num_tasks`` caps the rows used (None = all) and ``n`` is samples per task.
+    ``num_tasks`` caps the rows used (None = all), ``dataset_shuffle_seed`` optionally
+    shuffles them reproducibly before that cap, and ``n`` is samples per task.
     ``task_kwargs`` is merged into every task and passed through uninterpreted, so which
     keys an agent needs is a property of this config, not of the driver.
     """
@@ -299,6 +338,10 @@ class EvalConfig:
     # where the recipe's artifacts belong. Resolved when the run finishes, so a relative
     # path answers to whatever cwd the driver happened to have.
     report_dir: str
+    # Which rollout session runs each rollout, as `make_session` reads it: `backend` is the
+    # session class's import path, the rest that class's own keys.
+    rollout_session_backend: dict
+    dataset_shuffle_seed: int | None = None
     # max concurrent agent runs (None = `concurrency`, i.e. non-binding). Lower it to
     # hold containers warm while throttling how many talk to inference at once.
     rollout_concurrency: int | None = None
@@ -308,18 +351,6 @@ class EvalConfig:
     task_kwargs: dict = dataclasses.field(default_factory=dict)
     # seconds between EC2 monitor polls; 0 disables it.
     ec2_monitor_poll_interval: float = DEFAULT_POLL_INTERVAL
-
-
-def task_index(task_row: dict) -> int:
-    """The dataset's own index for a task row, resolved as verl resolves it.
-
-    verl's ``RLHFDataset`` promotes ``extra_info["index"]`` to a top-level ``index``,
-    which the training side reads as the task id; reading it the same way means an eval
-    task id names the same dataset row rather than a number that shifts with the slice.
-    """
-    if "index" in task_row:
-        return task_row["index"]
-    return (task_row.get("extra_info") or {}).get("index", 0)
 
 
 def token_stats(records: list[TraceRecord]) -> dict:
@@ -363,20 +394,22 @@ def local_bounds(config: EvalConfig) -> RolloutSessionBounds:
         rollout_semaphore=LocalPrioritySemaphore(config.rollout_concurrency or config.concurrency),
         container_priority_assigner=LocalPriorityAssigner(),
         rollout_priority_assigner=LocalPriorityAssigner(),
-        session_rate_limiter=ACRRateLimiter(config.session_create_rate),
+        session_rate_limiter=LocalRateLimiter(config.session_create_rate),
         container_setup_timeout=config.container_setup_timeout,
         agent_run_timeout=config.timeout,
     )
 
 
-class LateBoundLlmSession:
+class LateBoundLlmSession(RolloutSession):
     """Wraps a session so ``task["llm"]`` is built inside the bounded run, not before it.
 
     Rollout coroutines are all created up front, so a perishable Bedrock bearer token
     minted at dispatch would rot while its rollout waits for a container slot. ``run`` is
     the last point that still works -- the agent server reads ``task_input["llm"]`` only
     from the rollout-start payload -- so a token's age is bounded by ``agent_run_timeout``
-    rather than by the queue. The rest of :class:`RolloutSession` is delegated untouched.
+    rather than by the queue. The wrapped session gets a copy of the task, so the caller's,
+    which is dumped to S3, never holds the token. The rest of :class:`RolloutSession` is
+    delegated untouched.
     """
 
     def __init__(self, session: RolloutSession, build_llm: Callable[[], dict | None]) -> None:
@@ -397,9 +430,7 @@ class LateBoundLlmSession:
         # A ``None`` config means the endpoint has no inference, and the key must stay
         # absent rather than be set to None.
         llm = self._build_llm()
-        if llm is not None:
-            task["llm"] = llm
-        return await self._session.run(task)
+        return await self._session.run(task if llm is None else {**task, "llm": llm})
 
     async def shutdown(self) -> None:
         await self._session.shutdown()
@@ -407,8 +438,6 @@ class LateBoundLlmSession:
 
 async def run_one(
     config: EvalConfig,
-    runtime_arn: str,
-    capacity_provider_arn: str,
     experiment_start_at: str,
     task_row: dict,
     n_idx: int,
@@ -427,8 +456,7 @@ async def run_one(
     """
     session_id = SESSION_PREFIX + uuid4().hex
     endpoint = config.endpoint
-    index = task_index(task_row)
-    task_id = str(index)
+    task_id = task_row.get("task_id")
 
     # A PersistentDict over this session's item in the table training also writes to;
     # every mutation below persists itself, so DynamoDB tracks a rollout live.
@@ -444,9 +472,10 @@ async def run_one(
             "n_idx": n_idx,
             "model": endpoint.model,
             "endpoint": endpoint.label(),
+            "rollout_session_backend": config.rollout_session_backend["backend"],
             "temperature": config.temperature,
             "top_p": config.top_p,
-            "eval_start_at": dt.datetime.now(),
+            "rollout_session_start_at": dt.datetime.now(),
         },
         persister=DynamoDBPersister(
             session_table,
@@ -459,15 +488,11 @@ async def run_one(
     task = dict(task_row)
     task["sampling_params"] = sampling_params
     task.update(config.task_kwargs)
-    # No task["llm"] yet: LateBoundLlmSession fills it in once the bounded run reaches
-    # `run`, and shares this rollout's `meta` so session keys land in the same item.
+    # No task["llm"] here: LateBoundLlmSession adds it to the session's copy once the
+    # bounded run reaches `run`. The session shares this rollout's `meta`, so its keys land
+    # in the same item.
     session = LateBoundLlmSession(
-        AgentCoreSession(
-            session_id,
-            meta,
-            runtime_arn=runtime_arn,
-            capacity_provider_arn=capacity_provider_arn,
-        ),
+        make_session(session_id, config.rollout_session_backend, meta),
         lambda: endpoint.build_task_llm(session_id, config.temperature, config.top_p),
     )
 
@@ -501,7 +526,13 @@ async def run_one(
             )
         await meta.set("aborted", exception is not None)
     except Exception as error:
-        logger.error("rollout %s (instance=%s n_idx=%s) failed: %r", session_id, meta["instance_id"], n_idx, error)
+        logger.error(
+            "rollout %s (instance=%s n_idx=%s) failed: %s",
+            session_id,
+            meta["instance_id"],
+            n_idx,
+            describe_with_root_cause(error),
+        )
         exception = exception_to_string(error)
         await meta.set("aborted", True)
     finally:
@@ -527,7 +558,7 @@ async def run_one(
 
     await meta.update(
         {
-            "eval_end_at": dt.datetime.now(),
+            "rollout_session_end_at": dt.datetime.now(),
             **rollout_summary,
         }
     )
@@ -575,7 +606,8 @@ async def start_eval_ec2_monitor(config: EvalConfig, env: dict) -> EC2Monitor | 
     ``None`` means the run simply goes unstamped -- nothing downstream depends on it.
     """
     table = env.get("agent_dynamodb_table")
-    capacity_provider_arn = env.get("agentcore_capacity_provider_arn")
+    # It watches the session backend's capacity provider, so a backend without one isn't monitored.
+    capacity_provider_arn = config.rollout_session_backend.get("capacity_provider_arn")
     if config.ec2_monitor_poll_interval <= 0 or not table or not capacity_provider_arn:
         logger.info("ec2 monitor disabled for experiment=%s", config.experiment_name)
         return None
@@ -594,16 +626,15 @@ async def start_eval_ec2_monitor(config: EvalConfig, env: dict) -> EC2Monitor | 
 async def run_eval(config: EvalConfig, env: dict) -> dict:
     """Run one EvalConfig: start the endpoint and monitor, fan out the samples, aggregate.
 
-    The AgentCore ARNs, the session table and the output bucket come from ``env``;
-    anything the *task* needs rides in ``config.task_kwargs`` instead.
+    The session table and the output bucket come from ``env``, the session backend and
+    its settings from ``config.rollout_session_backend``; anything the *task* needs rides
+    in ``config.task_kwargs`` instead.
     """
     # Imported here, not at module scope: these ship in the ``swe-agent`` dependency
     # group, so importing this module stays a base-install operation.
     import polars as pl
     from tqdm import tqdm
 
-    runtime_arn = env["agentcore_runtime_arn"]
-    capacity_provider_arn = env["agentcore_capacity_provider_arn"]
     # Required here, unlike in the monitor: every rollout's state is written through it.
     session_table = env["agent_dynamodb_table"]
     storage_region = env["aws_region"]
@@ -611,6 +642,8 @@ async def run_eval(config: EvalConfig, env: dict) -> dict:
     s3_prefix = f"{env['rollout_output_s3']}/{experiment_start_at}"
 
     frame = pl.read_parquet(config.dataset)
+    if config.dataset_shuffle_seed is not None:
+        frame = frame.sample(fraction=1.0, shuffle=True, seed=config.dataset_shuffle_seed)
     if config.num_tasks is not None:
         frame = frame.head(config.num_tasks)
     task_rows = frame.to_dicts()
@@ -652,8 +685,6 @@ async def run_eval(config: EvalConfig, env: dict) -> dict:
             _tracked(
                 run_one(
                     config,
-                    runtime_arn,
-                    capacity_provider_arn,
                     experiment_start_at,
                     task_row,
                     n_idx,

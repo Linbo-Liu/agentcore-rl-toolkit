@@ -14,6 +14,25 @@ LLM agent rollouts are long-running — an agent may run for minutes or hours ma
 
 Both components use S3 as their data layer, but the complexity is fully abstracted — your code never reads from or writes to S3 directly.
 
+## Training Backends
+
+### Native Integrations
+
+Training integrations maintained in this repository use ART's rollout gateway for token-level trajectory capture.
+
+| Integration | Description | Get Started |
+|---|---|---|
+| **verl** | Self-hosted training with verl | [Setup guide](src/agentcore_rl_toolkit/backends/verl/README.md) |
+| **slime** | Self-hosted training with slime | [Setup guide](src/agentcore_rl_toolkit/backends/slime/examples/math_agent/SETUP.md) |
+| **SkyRL** | Self-hosted training through its Tinker-compatible API | [Training guide](src/agentcore_rl_toolkit/backends/tinker_api/README.md) · [Deployment example](src/agentcore_rl_toolkit/backends/tinker_api/skyrl/README.md) |
+| **Tinker** | Managed training through the official Tinker API | [Training guide](src/agentcore_rl_toolkit/backends/tinker_api/README.md) |
+
+SkyRL and Tinker share the toolkit's Tinker-compatible API integration.
+
+### External Integrations
+
+**[rLLM](https://docs.rllm-project.com/agent-runtimes/agentcore)** natively integrates with AWS Bedrock AgentCore Runtime. Follow the rLLM documentation for installation, configuration, and training. Use ART to [prepare and deploy your agent](#agent-side-adapting-your-agent-for-rl).
+
 ## Installation
 
 ```bash
@@ -45,7 +64,7 @@ While session routing is valuable for multi-turn production agents, RL rollouts 
 - **Async end-to-end**: Fire-and-forget server + future-based client — no long-lived TCP connections needed for long-running agent rollouts
 - **Simplified rollout collection**: `RolloutClient` manages concurrency, rate limiting, and S3 result polling out of the box for both training loops and batch evaluation
 - **Production parity**: Direct code reuse from production agents ensures training behavior matches real deployment
-- **Sandbox on ACR** (`SandboxClient` + `agentcore-sandboxd`): Run shell commands in arbitrary Docker images (e.g. SWE-bench-style coding environments) as isolated AgentCore runtime sessions — no agent server required in the image
+- **Sandbox on ACR** (`SandboxClient` + `agentcore-sandboxd`): Run programs in arbitrary Docker images (e.g. SWE-bench-style coding environments) as isolated AgentCore runtime sessions — no agent server required in the image
 
 ## Agent-Side: Adapting Your Agent for RL
 
@@ -90,7 +109,8 @@ reward_fn = GSM8KReward()  # user-defined reward function
 def invoke_agent(payload: dict):
     base_url = payload["_rollout"]["base_url"]
     model_id = payload["_rollout"]["model_id"]
-    model = OpenAIModel(client_args={"api_key": "EMPTY", "base_url": base_url}, model_id=model_id)
+    api_key = payload["_rollout"].get("api_key") or "EMPTY"
+    model = OpenAIModel(client_args={"api_key": api_key, "base_url": base_url}, model_id=model_id)
     agent = Agent(model=model, tools=[...], system_prompt="...")
 
     response = agent(payload.get("prompt"))
@@ -114,21 +134,21 @@ def invoke_agent(payload: dict):
 
 RL for LLMs trains on token sequences, so trainers need the exact token IDs sampled by the model. But agents communicate via OpenAI-compatible APIs that return text, not tokens. Re-tokenizing that text back into IDs causes **retokenization drift** — the reconstructed IDs may differ from what the model actually generated, leading to off-policy updates that destabilize training. This drift has [three common sources](https://vllm.ai/blog/agent-lightning): (1) non-unique tokenization (e.g., `H`+`AVING` retokenizes as `HAV`+`ING`), (2) tool-call serialization changes (whitespace/formatting shifts during parsing and re-rendering), and (3) chat template misalignment across frameworks.
 
-The solution is to capture token IDs directly from the inference server, avoiding retokenization entirely. [rllm-model-gateway](https://github.com/rllm-org/rllm/tree/main/rllm-model-gateway) does this as a transparent HTTP proxy between agents and the inference server:
+The toolkit's [rollout gateway](src/agentcore_rl_toolkit/rollout_gateway/) owns rendering and tokenization. It renders messages into prompt token IDs, sends them to a token-in/token-out sampling backend, and records the generated token IDs and logprobs directly:
 
 ```
-Agent  ──►  rllm-model-gateway  ──►  Inference Server (vLLM/SGLang)
-                    │
-                    └─► captures token IDs + logprobs, scoped by session
+Agent  ──►  RolloutGateway  ──►  Sampling backend
+              │                   (verl / SGLang / Tinker API)
+              └─► token IDs + logprobs + loss masks, scoped by session
 ```
 
-The gateway intercepts OpenAI-compatible API responses and extracts token data directly from the server. Crucially, it scopes captured data by session ID — so when hundreds of concurrent agent sessions hit the same gateway, each rollout's token trace is correctly associated with its trajectory. Agents use a standard `OpenAIModel` and are completely unaware of the capture.
+OpenAI- and Anthropic-compatible adapters let agents keep their native chat clients. A session key passed through the API-key field associates model calls with each rollout. The gateway assembles multi-turn trajectories and loss masks while preserving the original generated tokens, including when tool calls or branching conversations change the rendered history.
 
 In practice, this is infrastructure managed by the training framework:
 - **During training**: the training engine points `base_url` through the gateway automatically
 - **During evaluation**: `base_url` points directly to any OpenAI-compatible endpoint (vLLM, SGLang, LiteLLM, etc.), or you can use `BedrockModel` via the Bedrock API — no gateway involved
 
-The gateway is [available on PyPI](https://pypi.org/project/rllm-model-gateway/) (`pip install rllm-model-gateway`). See the [rllm-model-gateway repo](https://github.com/rllm-org/rllm/tree/main/rllm-model-gateway) for details.
+The gateway is included in the toolkit's `gateway` extra. Follow your [integration's setup guide](#training-backends) for its dependencies and configuration.
 
 ## Client-Side: Invoking Agents and Collecting Results
 
@@ -231,8 +251,8 @@ The training architecture follows a **decoupled design** where agent rollouts an
 │       └───────┬─────────────┘    └───────▲─────────────┘       │
 │               │                          │                     │
 │               │                  ┌───────┴─────────────┐       │
-│               │                  │ rllm-model-gateway  │       │
-│               │                  │ (token capture)     │       │
+│               │                  │   RolloutGateway    │       │
+│               │                  │ (render + capture)  │       │
 │               │                  └───────▲─────────────┘       │
 └───────────────┼──────────────────────────┼─────────────────────┘
                 │ 1. Submit N prompts      │                        ◄── ART Client-Side (1): RolloutClient
@@ -267,9 +287,7 @@ The training architecture follows a **decoupled design** where agent rollouts an
 
 This architecture enables parallel and highly efficient rollouts with secure execution during RL training. The decoupled design means training libraries only need the agent's container image to start training—agent code and dependencies stay completely separate from the training library.
 
-**Supported Training Libraries:**
-- [rLLM](https://github.com/rllm-org/rllm) — supports multiple backends (veRL, Tinker, and more)
-  - [Math Agent](examples/strands_math_agent/): [Tinker](https://github.com/rllm-org/rllm/blob/main/examples/agentcore_math/train_agentcore_math_tinker.sh)
+Choose a setup guide from [Training Backends](#training-backends).
 
 ### Prepare Your Agent Container
 
@@ -312,18 +330,18 @@ chmod +x scripts/build_docker_image_and_push_to_ecr.sh
 
 ## Sandbox: Command Execution in Arbitrary Images
 
-Coding-agent evaluation and RL training typically start from prebuilt environment images (repository checkout, dependencies, test runner) that are not HTTP agent servers. The sandbox SDK bridges them onto AgentCore Runtime: a tiny health shim (`agentcore-sandboxd`, built from [`sandboxd/`](./sandboxd/)) is added to the image to satisfy the ACR container contract, and commands run through ACR's native `InvokeAgentRuntimeCommand` API.
+Coding-agent evaluation and RL training typically start from prebuilt environment images (repository checkout, dependencies, test runner) that are not HTTP agent servers. The sandbox SDK bridges them onto AgentCore Runtime: a small daemon (`agentcore-sandboxd`, built from [`sandboxd/`](./sandboxd/)) is added to the image to satisfy the ACR container contract. The SDK sends argv commands through `InvokeAgentRuntime`; the daemon owns their execution and persists results.
 
 ```python
 from agentcore_rl_toolkit.sandbox import SandboxClient
 
 client = SandboxClient(runtime_arn="arn:aws:bedrock-agentcore:...:runtime/...")
 with client.start() as sb:
-    result = sb.exec("cd /app && pytest -q", timeout=900)
+    result = sb.exec(["pytest", "-q"], cwd="/app", timeout=900)
     print(result.exit_code, result.stdout)
 ```
 
-Failing commands and timeouts are results, not exceptions — exactly what reward functions need. See [`examples/sandbox_quickstart/`](./examples/sandbox_quickstart/) for the full walkthrough (build the shim binary, wrap and push an image, create a runtime, run commands).
+Nonzero exits return results. Execution timeouts raise `ExecTimeoutError` with partial output in `.result`. See [`examples/sandbox_quickstart/`](./examples/sandbox_quickstart/) for the full walkthrough (build the daemon, wrap and push an image, create a runtime, run commands).
 
 ## Contributing
 

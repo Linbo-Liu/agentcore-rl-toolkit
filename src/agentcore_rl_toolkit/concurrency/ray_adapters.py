@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, AsyncGenerator
 
 from agentcore_rl_toolkit.concurrency.priority_assigner import LocalPriorityAssigner
 from agentcore_rl_toolkit.concurrency.priority_semaphore import LocalPrioritySemaphore
-from agentcore_rl_toolkit.concurrency.rate_limiter import ACRRateLimiter
+from agentcore_rl_toolkit.concurrency.rate_limiter import LocalRateLimiter
 
 if TYPE_CHECKING:
     from ray.actor import ActorProxy
@@ -53,8 +53,36 @@ class RayPriorityAssigner:
 class RayRateLimiter:
     """Adapts a Ray actor handle to the :class:`~.rate_limiter.RateLimiter` interface."""
 
-    def __init__(self, actor: "ActorProxy[ACRRateLimiter]") -> None:
+    def __init__(self, actor: "ActorProxy[LocalRateLimiter]") -> None:
         self._actor = actor
 
     async def wait_async(self) -> None:
         await self._actor.wait_async.remote()
+
+
+def make_priority_semaphore(
+    name: str, semaphore_concurrency: int, acquire_concurrency: int
+) -> "ActorProxy[LocalPrioritySemaphore]":
+    """Create a Ray actor with a dedicated concurrency group for ``release``.
+
+    Import Ray only when constructing the actor so the protocol adapters above
+    remain usable in non-Ray unit-test and agent environments.
+    """
+    import ray
+
+    class ConcurrencyGroupedSemaphore(LocalPrioritySemaphore):
+        """Keep ``release`` schedulable when all acquire slots are occupied."""
+
+        @ray.method(concurrency_group="release")
+        async def release(self) -> None:
+            await super().release()
+
+    return (
+        ray.remote(concurrency_groups={"release": semaphore_concurrency})(ConcurrencyGroupedSemaphore)
+        .options(
+            name=name,
+            get_if_exists=True,
+            max_concurrency=acquire_concurrency,
+        )
+        .remote(value=semaphore_concurrency)
+    )

@@ -1,5 +1,6 @@
 """Integration tests for ``RolloutGateway`` — the assembled serving unit."""
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 
@@ -34,7 +35,7 @@ class FakeRenderer:
         inv = {v: k for k, v in self.vocab.items()}
         return " ".join(inv.get(i, "?") for i in ids)
 
-    def render(self, messages, *, tools=None, add_generation_prompt=True):
+    async def render(self, messages, *, tools=None, add_generation_prompt=True):
         ids: list[int] = []
         for m in messages:
             ids += self._encode(f"{m['role']}:")
@@ -107,6 +108,40 @@ async def serve(gateway: RolloutGateway):
 
 def bearer(sid: str) -> dict:
     return {"Authorization": f"Bearer {sid}"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("history_mode", ["tree", "linear"])
+async def test_close_during_async_render_does_not_generate(history_mode):
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class BlockingRenderer(FakeRenderer):
+        async def render(self, messages, **kwargs):
+            entered.set()
+            await release.wait()
+            return [1]
+
+    renderer = BlockingRenderer()
+    backend = FakeBackend(renderer, ["should not be generated"])
+    gateway = RolloutGateway(backend=backend, renderer=renderer, history_mode=history_mode)
+    gateway.create_session("closing")
+    async with serve(gateway) as client:
+        request = asyncio.ensure_future(
+            client.post(
+                "/v1/chat/completions",
+                json={"model": "x", "messages": [{"role": "user", "content": "q"}]},
+                headers=bearer("closing"),
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 1)
+        finishing = asyncio.create_task(gateway.finish_session("closing"))
+        await asyncio.sleep(0)  # shutdown marks the session closed before draining
+        assert "closing" in gateway.adapters[0].closed
+        release.set()
+        response = await asyncio.wait_for(request, 1)
+        assert response.status == 503
+        assert await asyncio.wait_for(finishing, 1) == []
+        assert backend.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -224,9 +259,8 @@ async def test_mixed_text_and_parallel_tool_calls_reach_the_client():
     """The reply must carry the assistant's text *and* every tool call.
 
     Withholding either makes the client echo a history that no longer re-renders to
-    the sampled tokens, so the next turn drifts: the previous response span is
-    overwritten at loss_mask=0 (REALIGN) or split off (FORK). The trained-token
-    assertion below is what catches that -- it fails long before any reward metric
+    the sampled tokens, so the next turn drifts and splits off a record (FORK).
+    The single-record and trained-token assertions below catch that before any reward metric
     moves, and the damage grows with turn count.
     """
     reply1 = "checking both sums CALL calculator expr=2+2 CALL calculator expr=3+3"
@@ -408,7 +442,7 @@ async def test_max_turns_per_sid_returns_429():
 
 
 @pytest.mark.asyncio
-async def test_max_context_tokens_short_circuits_with_length_finish():
+async def test_max_context_tokens_returns_context_window_error():
     gateway, backend = make_gateway(replies=["never sampled"])
     sid = "ep7:tiny"
 
@@ -417,13 +451,36 @@ async def test_max_context_tokens_short_circuits_with_length_finish():
         gateway.create_session(sid, max_context_tokens=2)
         body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
         resp = await client.post("/v1/chat/completions", json=body, headers=bearer(sid))
-        assert resp.status == 200
-        choice = (await resp.json())["choices"][0]
-        assert choice["finish_reason"] == "length"
-        assert choice["message"]["content"] is None
+        assert resp.status == 400
+        error = (await resp.json())["error"]
+        assert error["type"] == "invalid_request_error"
+        assert error["code"] == "context_length_exceeded"
+        assert error["message"] == (
+            "This model's maximum context length is 2 tokens. "
+            "However, your prompt contains 3 input tokens, which leaves no room for output tokens. "
+            "Please reduce the length of the messages."
+        )
         assert backend.calls == []  # backend never invoked
 
-        # an empty generated turn trains nothing -> no records
+        # a rejected input is not part of the trajectory
+        assert await gateway.finish_session(sid) == []
+
+
+@pytest.mark.asyncio
+async def test_anthropic_max_context_tokens_returns_context_window_error():
+    gateway, backend = make_gateway(replies=["never sampled"])
+    sid = "ep7:anthropic-tiny"
+
+    async with serve(gateway) as client:
+        gateway.create_session(sid, max_context_tokens=2)
+        body = {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}
+        resp = await client.post("/v1/messages", json=body, headers=bearer(sid))
+        assert resp.status == 400
+        error = await resp.json()
+        assert error["type"] == "error"
+        assert error["error"]["type"] == "invalid_request_error"
+        assert "maximum context length is 2 tokens" in error["error"]["message"]
+        assert backend.calls == []
         assert await gateway.finish_session(sid) == []
 
 

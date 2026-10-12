@@ -201,6 +201,9 @@ _TEMPLATE_HASHES: dict[str, str] = {
     # Local additions without TRL equivalents; keep below the vendored entries.
     # Qwen3-Coder uses Qwen3.5's XML tool-call syntax.
     "5a38bfa05833266240066aedc497decc9b00cc0d3e3b8cceea98cf530196ab06": "qwen3_5",  # Qwen3-Coder
+    # Qwen3.8 revises Qwen3.6's template (reasoning-effort preamble, preserve_thinking
+    # default) but keeps the same XML tool-call and <think> output format.
+    "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041": "qwen3_5",  # Qwen3.8
 }
 
 
@@ -217,8 +220,8 @@ _TEMPLATE_HASHES: dict[str, str] = {
 #
 # Rendering a replayed history therefore does not reproduce the tokens that were
 # sampled, so the next turn's prompt stops extending the captured sequence and the
-# trajectory manager has to REALIGN (dropping the turn's loss mask) or FORK (emitting
-# an extra row). Reordering the render to match generation restores the prefix.
+# trajectory manager has to FORK (emitting an extra row). Reordering the render to
+# match generation restores the prefix.
 #
 # Applies to the render path only; the parse path is handled by GPTOSS_SCHEMA.
 _GPTOSS_TOOLCALL_RENDER_ORIG = (

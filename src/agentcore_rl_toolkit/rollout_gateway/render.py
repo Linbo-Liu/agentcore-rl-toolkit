@@ -6,7 +6,7 @@ calls. Owning both directions in one place makes loss-masking well-defined and
 eliminates cross-backend retokenization drift. It is also required for sample-only
 inference backends (e.g. Tinker) that cannot render themselves.
 
-Two implementations behind one :class:`Renderer` protocol:
+HF rendering behind the :class:`Renderer` protocol:
 
 * :class:`HfTemplateRenderer` (default, lightweight) — renders with the HF tokenizer's
   ``apply_chat_template``. Derendering picks the strongest available path: when the
@@ -17,14 +17,10 @@ Two implementations behind one :class:`Renderer` protocol:
   tool parser — each independently overridable via ``reasoning_parser`` /
   ``tool_parser`` and each defaulting to the dependency-free implementation
   (``</think>`` split / ``<tool_call><function=...>`` regex). Passing either stage
-  parser disables schema detection: explicit injection (e.g. slime supplying SGLang's
-  detectors) always wins. Tool-bearing requests with no matched schema and no
+  parser disables schema detection: explicit injection (e.g. a trainer supplying its
+  engine's detectors) always wins. Tool-bearing requests with no matched schema and no
   injected ``tool_parser`` are rejected rather than guessed at. Needs only
   ``transformers``.
-* :class:`TinkerRenderer` — wraps a tinker-cookbook ``Renderer`` (install ``tinker``
-  and ``tinker-cookbook`` manually; they require Python >=3.11). Its ``tinker_cookbook``
-  import (which pulls torch) is deferred into ``__init__``, so importing this module
-  stays torch-free; the heavy import fires only when a ``TinkerRenderer`` is constructed.
 """
 
 import dataclasses
@@ -42,11 +38,24 @@ from .response_schemas import (
 
 logger = logging.getLogger(__name__)
 
+# Distinct assistant bodies for probing template closers, shared with the full healer.
+_PROBE_A = "linprobe body alpha 00000"
+_PROBE_B = "linprobe body omega 99999"
+
 # The two derender stages, as injectable callables:
 #   ReasoningParser: raw_output -> (reasoning, body_text)
 #   ToolParser     : (body_text, tools_schema) -> (text, tool_uses, ill_formed)
 ReasoningParserFn = Callable[[str], tuple[str, str]]
 ToolParserFn = Callable[[str, list[dict]], tuple[str, list[dict[str, Any]], bool]]
+
+
+def _common_suffix(a: str | list[int], b: str | list[int]) -> str | list[int]:
+    """The longest common suffix of two strings or token-ID lists."""
+    limit = min(len(a), len(b))
+    i = 0
+    while i < limit and a[-1 - i] == b[-1 - i]:
+        i += 1
+    return a[len(a) - i :]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -66,20 +75,17 @@ class ParsedOutput:
 class Renderer(Protocol):
     """The gateway's tokenization seam.
 
-    ``render``             : canonical chat messages (+ tools) -> prompt ``token_ids``;
-                             ``chat_template_kwargs`` are per-request template variables
-                             (e.g. ``enable_thinking``) from the client's request body
+    ``await render``       : canonical chat messages (+ tools) -> prompt ``token_ids``
     ``get_stop_sequences`` : stop strings / token ids for sampling
     ``parse``              : sampled response ``token_ids`` -> :class:`ParsedOutput`
     """
 
-    def render(
+    async def render(
         self,
         messages: list[dict],
         *,
         tools: list[dict] | None = None,
         add_generation_prompt: bool = True,
-        chat_template_kwargs: dict | None = None,
     ) -> list[int]:
         ...
 
@@ -121,8 +127,7 @@ class HfTemplateRenderer:
         an explicit opt-in (``tool_parser=parse_tool_uses``).
 
       Passing either parser disables schema detection entirely: explicit injection
-      always wins. That is how a backend supplies its own engine's detectors (e.g.
-      SGLang's) without this package importing an engine.
+      always wins.
     """
 
     def __init__(
@@ -168,28 +173,125 @@ class HfTemplateRenderer:
             # (the [gateway] extra); no availability guard needed.
             if schema_name is not None:
                 self._schema = RESPONSE_SCHEMAS[schema_name]
+        # Pin the Rust backend's ``encode_special_tokens`` once, at construction.
+        # The property setter takes a mutable borrow on the Tokenizer, and
+        # tokenizers 0.22.2's async_encode holds a borrow across the returned
+        # future — a concurrent request that tried to re-set the property while
+        # another request's Rust encode work was still in flight raised
+        # ``RuntimeError: Already borrowed``. The gateway's configured value is
+        # constant per renderer, so we take the borrow once here and leave the
+        # per-call encode path read-only against the backend. Guarded so
+        # non-HF-fast stubs used by the parse-only tests still construct.
+        backend = getattr(tokenizer, "backend_tokenizer", None)
+        if backend is not None:
+            tokenizer_kwargs = self._chat_template_kwargs.get("tokenizer_kwargs") or {}
+            split_special_tokens = tokenizer_kwargs.get("split_special_tokens")
+            backend.encode_special_tokens = (
+                tokenizer.split_special_tokens if split_special_tokens is None else split_special_tokens
+            )
 
-    def render(
+    def _render_text(self, messages, *, tools=None, add_generation_prompt=True) -> str:
+        return self.tokenizer.apply_chat_template(
+            self._rekey_reasoning(messages),
+            tools=tools,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            return_dict=False,
+            **({"chat_template": self._chat_template} if self._chat_template else {}),
+            **self._chat_template_kwargs,
+        )
+
+    async def _encode(
+        self, text: str, *, padding=False, truncation=False, max_length=None, return_tensors=None, **kwargs
+    ) -> list[int]:
+        """Encode rendered text with HF options and native async tokenization.
+
+        HF currently has no async equivalent of ``apply_chat_template``. The
+        setup below mirrors the encoding configuration normally handled by its
+        synchronous tokenizer wrapper, then awaits the native ``async_encode``
+        call. Template rendering itself remains synchronous in ``_render_text``.
+        """
+        if return_tensors is not None or kwargs.get("return_overflowing_tokens", False):
+            raise ValueError("The gateway requires a single list[int], not tensor or overflow batches")
+        padding_strategy, truncation_strategy, max_length, _ = self.tokenizer._get_padding_truncation_strategies(
+            padding=padding, truncation=truncation, max_length=max_length, **kwargs
+        )
+        self.tokenizer.set_truncation_and_padding(
+            padding_strategy=padding_strategy,
+            truncation_strategy=truncation_strategy,
+            max_length=max_length,
+            stride=kwargs.get("stride", 0),
+            pad_to_multiple_of=kwargs.get("pad_to_multiple_of"),
+            padding_side=kwargs.get("padding_side"),
+        )
+        backend = self.tokenizer.backend_tokenizer
+        encoding = await backend.async_encode(
+            text,
+            pair=kwargs.get("text_pair") or None,
+            is_pretokenized=kwargs.get("is_split_into_words", False),
+            add_special_tokens=kwargs.get("add_special_tokens", False),
+        )
+        return encoding.ids
+
+    async def render(
         self,
         messages: list[dict],
         *,
         tools: list[dict] | None = None,
         add_generation_prompt: bool = True,
-        chat_template_kwargs: dict | None = None,
     ) -> list[int]:
-        # return_dict=False: we want only the token ids. The dict form (the
-        # transformers>=5 default) bundles an attention mask, but that is a padding
-        # artifact the training backend builds itself when it batches rows.
-        ids = self.tokenizer.apply_chat_template(
-            self._rekey_reasoning(messages),
+        """Render with HF, then apply its encoding options using native async."""
+        kwargs = self._chat_template_kwargs
+        text = self._render_text(
+            messages,
             tools=tools,
-            tokenize=True,
             add_generation_prompt=add_generation_prompt,
-            return_dict=False,
-            **({"chat_template": self._chat_template} if self._chat_template else {}),
-            **{**self._chat_template_kwargs, **(chat_template_kwargs or {})},
         )
-        return list(ids)
+        tokenizer_kwargs = kwargs.get("tokenizer_kwargs")
+        return await self._encode(
+            text,
+            padding=kwargs.get("padding", False),
+            truncation=kwargs.get("truncation", False),
+            max_length=kwargs.get("max_length"),
+            return_tensors=kwargs.get("return_tensors"),
+            add_special_tokens=False,
+            **(tokenizer_kwargs if tokenizer_kwargs is not None else {}),
+        )
+
+    async def render_delta(
+        self,
+        prev_messages: list[dict],
+        new_messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+    ) -> tuple[list[int], list[int]] | None:
+        """Render real history to text, encoding only its closer and appended tail.
+
+        ``prev_messages`` ends with the stored assistant message. Keeping real
+        history lets templates use earlier messages when formatting the new tail.
+        """
+        before = self._render_text(prev_messages, tools=tools, add_generation_prompt=False)
+        after = self._render_text(prev_messages + new_messages, tools=tools, add_generation_prompt=True)
+        if not after.startswith(before):
+            return None
+
+        # Probe with text bodies so a tool-call wrapper is not mistaken for the
+        # assistant closer.
+        a, b = [
+            self._render_text(
+                prev_messages[:-1] + [{"role": "assistant", "content": body}],
+                tools=tools,
+                add_generation_prompt=False,
+            )
+            for body in (_PROBE_A, _PROBE_B)
+        ]
+        close = _common_suffix(a, b)
+        if not before.endswith(close):
+            return None
+
+        # Slice the tail in text first; BPE merges across the boundary can change
+        # the token prefix even when the text prefix is unchanged.
+        return await self._encode(close), await self._encode(after[len(before) :])
 
     def _rekey_reasoning(self, messages: list[dict]) -> list[dict]:
         """Move assistant ``reasoning_content`` to the key this template reads.
@@ -289,121 +391,4 @@ class HfTemplateRenderer:
         )
 
 
-class TinkerRenderer:
-    """Wrap a tinker-cookbook ``Renderer`` (built via its ``get_renderer`` factory).
-
-    Required for the Tinker sampling backend (Tinker is sample-only and cannot render
-    itself), and usable with any backend. The ``tinker_cookbook`` import is deferred
-    into ``__init__`` so importing ``render`` stays torch-free; constructing a
-    ``TinkerRenderer`` is what pulls tinker + torch (install ``tinker`` and
-    ``tinker-cookbook`` manually; they require Python >=3.11).
-
-    Maps the tinker-cookbook API onto the :class:`Renderer` protocol:
-    - ``render``             -> ``build_generation_prompt(messages).to_ints()`` (+ tool prefix)
-    - ``get_stop_sequences`` -> passthrough
-    - ``parse``              -> ``parse_response(ids)`` -> :class:`ParsedOutput`
-      (``ParseTermination.MALFORMED`` -> ``ill_formed=True``)
-    """
-
-    def __init__(self, model_name: str, *, renderer_name: str | None = None, tokenizer: Any = None) -> None:
-        from tinker_cookbook import renderers, tokenizer_utils
-
-        self.model_name = model_name
-        tok = tokenizer if tokenizer is not None else tokenizer_utils.get_tokenizer(model_name)
-        self.tokenizer = tok
-        name = renderer_name or self._default_renderer_name(model_name)
-        self._renderer = renderers.get_renderer(name, tok)
-
-    @staticmethod
-    def _default_renderer_name(model_name: str) -> str:
-        m = model_name.lower()
-        if "qwen3" in m or "qwen-3" in m:
-            return "qwen3"
-        if "llama-3" in m or "llama3" in m:
-            return "llama3"
-        if "deepseek" in m:
-            return "deepseekv3"
-        # Fall back to qwen3 for the common instruct case; caller can pass renderer_name.
-        return "qwen3"
-
-    def render(
-        self,
-        messages: list[dict],
-        *,
-        tools: list[dict] | None = None,
-        add_generation_prompt: bool = True,
-        chat_template_kwargs: dict | None = None,
-    ) -> list[int]:
-        if chat_template_kwargs:
-            logger.warning("TinkerRenderer ignores chat_template_kwargs %s", sorted(chat_template_kwargs))
-        msgs = list(messages)
-        if tools:
-            # tinker-cookbook tool schemas are ToolSpec dicts {name, description, parameters};
-            # our tools_schema is OpenAI shape {"function": {name, description, parameters}}.
-            tool_specs = [self._to_tool_spec(t) for t in tools]
-            prefix = self._renderer.create_conversation_prefix_with_tools(tool_specs)
-            msgs = list(prefix) + msgs
-        if add_generation_prompt:
-            model_input = self._renderer.build_generation_prompt(msgs)
-        else:
-            # supervised-style render of the full conversation without the trailing
-            # generation header; build_supervised_example returns (ModelInput, weights).
-            model_input, _ = self._renderer.build_supervised_example(msgs)
-        return list(model_input.to_ints())
-
-    @staticmethod
-    def _to_tool_spec(tool: dict) -> dict:
-        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
-        return {
-            "name": fn.get("name"),
-            "description": fn.get("description", ""),
-            "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
-        }
-
-    def get_stop_sequences(self) -> list[str] | list[int]:
-        return list(self._renderer.get_stop_sequences())
-
-    def parse(self, output_ids: list[int], *, tools_schema: list[dict] | None = None) -> ParsedOutput:
-        message, termination = self._renderer.parse_response(list(output_ids))
-        ill_formed = not termination.is_clean
-
-        reasoning_parts: list[str] = []
-        text_parts: list[str] = []
-        tool_uses: list[dict[str, Any]] = []
-
-        content = message.get("content")
-        if isinstance(content, str):
-            text_parts.append(content)
-        elif isinstance(content, list):
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                ptype = part.get("type")
-                if ptype == "thinking":
-                    reasoning_parts.append(part.get("thinking", "") or part.get("text", ""))
-                elif ptype in ("text", "output_text"):
-                    text_parts.append(part.get("text", ""))
-
-        for call in message.get("tool_calls") or []:
-            fn = call.get("function", call) if isinstance(call, dict) else {}
-            name = fn.get("name") or (call.get("name") if isinstance(call, dict) else None) or "tool"
-            args = fn.get("arguments")
-            if isinstance(args, str):
-                import json
-
-                try:
-                    args = json.loads(args or "{}")
-                except json.JSONDecodeError:
-                    args = {"_raw_arguments": args}
-                    ill_formed = True
-            tool_uses.append({"name": name, "input": args if isinstance(args, dict) else {}})
-
-        return ParsedOutput(
-            reasoning="".join(reasoning_parts),
-            text="".join(text_parts),
-            tool_uses=tool_uses,
-            ill_formed=ill_formed,
-        )
-
-
-__all__ = ["HfTemplateRenderer", "ParsedOutput", "Renderer", "TinkerRenderer"]
+__all__ = ["HfTemplateRenderer", "ParsedOutput", "Renderer"]

@@ -6,6 +6,7 @@ bookkeeping. No AWS: the session store, the S3 upload and the rollout session ar
 
 import asyncio
 import json
+import tempfile
 import unittest
 from unittest import IsolatedAsyncioTestCase
 
@@ -35,12 +36,16 @@ SILENT = RolloutDumpResponse(
     exception=None,
     metrics={"num_tool_calls": 1.0},
 )
+# A row's identity fields: `task_id` is read off the row, not its position.
+TASK_ROW = {"task_id": "repo__proj-1", "instance_id": "repo__proj-1"}
+SESSION_BACKEND = {"backend": "some.module.Session", "capacity_provider_arn": "arn:capacity"}
 
 
 class FakeSession:
     """A rollout session that records the task each phase saw."""
 
-    def __init__(self, *args, rollout: RolloutDumpResponse = GOOD, **kwargs):
+    def __init__(self, *args, rollout: RolloutDumpResponse = GOOD, error: Exception | None = None, **kwargs):
+        self.error = error
         self.rollout = rollout
         self.setup_task: dict | None = None
         self.run_task: dict | None = None
@@ -57,6 +62,8 @@ class FakeSession:
     async def setup(self, task):
         # a copy: run() mutates the same dict, and the question is what setup saw
         self.setup_task = dict(task)
+        if self.error is not None:
+            raise self.error
 
     async def run(self, task):
         self.run_task = dict(task)
@@ -96,6 +103,15 @@ class LateBoundLlmSessionTest(IsolatedAsyncioTestCase):
         async with wrapper:
             await wrapper.run({"index": 1})
         self.assertEqual(self.built, 1)
+
+    async def test_the_callers_task_never_holds_the_llm(self):
+        # The caller dumps its task to S3, and the llm config carries a bearer token.
+        wrapper = self.build({"api_key": "token"})
+        task = {"index": 1}
+        async with wrapper:
+            await wrapper.run(task)
+        self.assertEqual(task, {"index": 1})
+        self.assertEqual(self.inner.run_task, {"index": 1, "llm": {"api_key": "token"}})
 
     async def test_a_none_config_leaves_the_key_absent(self):
         # NullEndpoint has no inference; the key must stay unset rather than be None, so
@@ -141,6 +157,8 @@ def eval_config(**overrides):
     kwargs = dict(
         experiment_name="unit-test",
         endpoint=bae.NullEndpoint(),
+        # `make_session` is faked wherever a session is built.
+        rollout_session_backend=dict(SESSION_BACKEND),
         dataset="unused.parquet",
         num_tasks=1,
         n=1,
@@ -155,15 +173,95 @@ def eval_config(**overrides):
     return bae.EvalConfig(**kwargs)
 
 
+class EvalMonitorTest(IsolatedAsyncioTestCase):
+    """The EC2 monitor watches the session backend's capacity provider, if it has one."""
+
+    ENV = {"agent_dynamodb_table": "sessions-table", "aws_region": "us-west-2"}
+
+    def setUp(self):
+        self.monitors = []
+        test = self
+
+        class FakeMonitor:
+            def __init__(self, capacity_provider_arn, table, **kwargs):
+                test.monitors.append((capacity_provider_arn, table))
+
+            async def start(self):
+                pass
+
+        original = bae.EC2Monitor
+        bae.EC2Monitor = FakeMonitor
+        self.addCleanup(setattr, bae, "EC2Monitor", original)
+
+    async def test_a_backend_with_a_capacity_provider_is_monitored(self):
+        self.assertIsNotNone(await bae.start_eval_ec2_monitor(eval_config(), self.ENV))
+        self.assertEqual(self.monitors, [("arn:capacity", "sessions-table")])
+
+    async def test_a_backend_without_one_is_not(self):
+        config = eval_config(rollout_session_backend={"backend": "some.module.Session"})
+        self.assertIsNone(await bae.start_eval_ec2_monitor(config, self.ENV))
+        self.assertEqual(self.monitors, [])
+
+
+class RunEvalDatasetTest(IsolatedAsyncioTestCase):
+    async def test_seeded_shuffle_is_reproducible_and_precedes_task_limit(self):
+        import polars as pl
+
+        with tempfile.TemporaryDirectory() as directory:
+            dataset = f"{directory}/tasks.parquet"
+            report_dir = f"{directory}/reports"
+            task_ids = list(range(10))
+            pl.DataFrame({"task_id": task_ids}).write_parquet(dataset)
+            seen_task_ids: list[list[int]] = []
+
+            async def fake_run_one(config, *args):
+                task = args[1]
+                seen_task_ids[-1].append(task["task_id"])
+                return {"resolved": False, "aborted": False}
+
+            async def no_monitor(config, env):
+                return None
+
+            originals = {
+                "run_one": bae.run_one,
+                "start_eval_ec2_monitor": bae.start_eval_ec2_monitor,
+                "build_report": bae.build_report,
+            }
+            bae.run_one = fake_run_one
+            bae.start_eval_ec2_monitor = no_monitor
+            bae.build_report = lambda *args: {"reward": {"pass_at_k": None, "mean_reward": None}}
+            config = eval_config(
+                dataset=dataset,
+                num_tasks=4,
+                dataset_shuffle_seed=42,
+                report_dir=report_dir,
+            )
+            env = {
+                "agent_dynamodb_table": "sessions-table",
+                "aws_region": "us-west-2",
+                "rollout_output_s3": "s3://bucket/prefix",
+            }
+            try:
+                for _ in range(2):
+                    seen_task_ids.append([])
+                    await bae.run_eval(config, env)
+            finally:
+                for name, original in originals.items():
+                    setattr(bae, name, original)
+
+        self.assertEqual(seen_task_ids[0], seen_task_ids[1])
+        self.assertEqual(len(seen_task_ids[0]), 4)
+        self.assertNotEqual(seen_task_ids[0], task_ids[:4])
+
+
 class RunOneTest(IsolatedAsyncioTestCase):
     """run_one driven end to end: what lands in the report row and in S3."""
 
     def setUp(self):
         self.uploads: dict[str, dict] = {}
         self.sessions: list[FakeSession] = []
-        self._originals = {
-            name: getattr(bae, name) for name in ("AgentCoreSession", "upload_object", "DynamoDBPersister")
-        }
+        self.session_configs: list[dict] = []
+        self._originals = {name: getattr(bae, name) for name in ("make_session", "upload_object", "DynamoDBPersister")}
 
         async def fake_upload(s3_uri, region_name, data):
             self.uploads[s3_uri] = json.loads(data)
@@ -176,20 +274,19 @@ class RunOneTest(IsolatedAsyncioTestCase):
         for name, original in self._originals.items():
             setattr(bae, name, original)
 
-    async def run_one(self, rollout: RolloutDumpResponse, **config_overrides):
-        def make_session(*args, **kwargs):
-            session = FakeSession(rollout=rollout)
+    async def run_one(self, rollout: RolloutDumpResponse, error: Exception | None = None, **config_overrides):
+        def make_session(session_id, cfg, meta):
+            self.session_configs.append(cfg)
+            session = FakeSession(rollout=rollout, error=error)
             self.sessions.append(session)
             return session
 
-        bae.AgentCoreSession = make_session
+        bae.make_session = make_session
         config = eval_config(**config_overrides)
         row = await bae.run_one(
             config,
-            "arn:runtime",
-            "arn:capacity",
             "2026-09-03T00:00:00",
-            {"index": 7, "instance_id": "repo__proj-1"},
+            dict(TASK_ROW),
             0,
             bae.local_bounds(config),
             "s3://bucket/prefix",
@@ -242,12 +339,31 @@ class RunOneTest(IsolatedAsyncioTestCase):
         _, dumped = await self.run_one(FAILED)
         self.assertEqual(dumped["exception"], "Traceback: agent crashed")
 
+    async def test_a_setup_error_logs_a_summary_but_dumps_the_full_trace(self):
+        error = RuntimeError(
+            "setup did not reach input-required (state Traceback (most recent call last):\n"
+            '  File "/agent.py", line 1, in setup\n'
+            "RuntimeError: registry authentication denied"
+        )
+
+        with self.assertLogs(bae.logger, level="ERROR") as logs:
+            _, dumped = await self.run_one(GOOD, error=error)
+
+        self.assertIn("failed: RuntimeError: setup did not reach input-required", logs.output[0])
+        self.assertNotIn("Traceback", logs.output[0])
+        self.assertIn("Traceback (most recent call last):", dumped["exception"])
+
     async def test_a_silent_failure_is_aborted_with_a_reason(self):
         # aborted with a null exception would be uncategorisable in the report.
         row, dumped = await self.run_one(SILENT)
         self.assertIs(row["aborted"], True)
         self.assertIsNone(row["reward"])
         self.assertIsInstance(dumped["exception"], str)
+
+    async def test_the_session_is_the_one_the_config_names(self):
+        row, _ = await self.run_one(GOOD)
+        self.assertEqual(self.session_configs, [SESSION_BACKEND])
+        self.assertEqual(row["rollout_session_backend"], "some.module.Session")
 
     async def test_run_one_never_raises(self):
         # Callers gather every rollout: one failure must not take the batch down.
@@ -263,14 +379,12 @@ class RunOneTest(IsolatedAsyncioTestCase):
         def make_session(*args, **kwargs):
             return SlowSession()
 
-        bae.AgentCoreSession = make_session
+        bae.make_session = make_session
         config = eval_config(timeout=0.05)
         row = await bae.run_one(
             config,
-            "arn:runtime",
-            "arn:capacity",
             "2026-09-03T00:00:00",
-            {"index": 7, "instance_id": "repo__proj-1"},
+            dict(TASK_ROW),
             0,
             bae.local_bounds(config),
             "s3://bucket/prefix",
@@ -283,10 +397,15 @@ class RunOneTest(IsolatedAsyncioTestCase):
         ((_, dumped),) = self.uploads.items()
         self.assertIsNone(dumped["rollout_dump_response"])
 
-    async def test_the_task_id_is_the_datasets_own_index(self):
-        # So an eval task id names the same dataset row a training task id does.
+    async def test_the_task_id_is_the_datasets_own_task_id(self):
+        # So pass@k groups a task's n samples together, rather than by row position.
         row, _ = await self.run_one(GOOD)
-        self.assertEqual(row["task_id"], "7")
+        self.assertEqual(row["task_id"], "repo__proj-1")
+
+    async def test_the_instance_id_is_carried_onto_the_row(self):
+        # The benchmark's own name for the task: what the per-instance pass rates join on.
+        row, _ = await self.run_one(GOOD)
+        self.assertEqual(row["instance_id"], "repo__proj-1")
 
     async def test_the_s3_uri_is_recorded_on_the_row(self):
         row, _ = await self.run_one(GOOD)

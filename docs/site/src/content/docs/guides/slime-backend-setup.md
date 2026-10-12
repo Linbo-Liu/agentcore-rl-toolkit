@@ -1,13 +1,24 @@
 ---
-title: SLIME training backend setup
-description: Train an AgentCore Runtime-deployed agent with the SLIME training backend.
+title: slime training backend setup
+description: Train an AgentCore Runtime-deployed agent with the slime training backend.
 ---
 
 This doc describes how to train an AgentCore Runtime-deployed agent with the
-[slime](https://github.com/THUDM/slime) training backend. The public
-user surface is the
-[`SlimeRunner`](/agentcore-rl-toolkit/api/backends/slime/runner/)
-class for launching training.
+[slime](https://github.com/THUDM/slime) training backend. The integration
+plugs into slime's own `train.py` through two hook flags, so slime itself is
+unmodified:
+
+- `--custom-generate-function-path agentcore_rl_toolkit.backends.slime.integration.rollout.generate`
+  runs each rollout on AgentCore Runtime and turns the captured trajectory
+  into slime `Sample`s.
+- `--custom-reward-post-process-path agentcore_rl_toolkit.backends.slime.integration.rewards.normalize_episode_rewards`
+  applies GRPO group normalization that stays correct when one rollout
+  forks into several trajectory leaves.
+
+Each slime rollout process starts an in-repo rollout gateway in front of
+slime's SGLang router. The agent's OpenAI-compatible client points at that
+gateway, which records token IDs, logprobs, and loss masks for every model
+turn; rewards come from the dict the agent returns.
 
 For known issues (e.g. the norm-epsilon mismatch on
 Qwen2.5-32B-Instruct) see
@@ -15,117 +26,125 @@ Qwen2.5-32B-Instruct) see
 
 ## Prerequisites
 
-- A GPU cluster with **CUDA>=12.9** installed.
+- A GPU cluster with **CUDA 13** installed (the scripts default to
+  `/usr/local/cuda-13.0`).
 - Python 3.12+ and [`uv`](https://docs.astral.sh/uv/).
 - AWS credentials with permission to invoke an AgentCore Runtime and
   read/write an S3 bucket.
 - An AgentCore Runtime deployment of your agent — follow the
   [Prepare agent for RL](/agentcore-rl-toolkit/guides/agent-adaptation/)
-  guide. Save the resulting **runtime ARN** — required as the
-  `agent_runtime_arn` argument on `SlimeRunner` below for Agent rollouts.
-- An S3 bucket for rollout result delivery — required as the
-  `s3_bucket` argument on `SlimeRunner` below.
+  guide. The agent's model client must forward
+  `payload["_rollout"]["api_key"]`, which carries the gateway session key.
+  Save the resulting **runtime ARN**.
+- An S3 bucket for rollout result delivery.
+- Network routing from the AgentCore containers to the trainer node's
+  gateway port.
 
 ## Installation
 
-Choose **one** of the two paths below to install slime, then install
-the toolkit into the same environment.
-
-### Option A: Official slime docker
-
-Follow
-[slime's own installation docs](https://github.com/THUDM/slime#installation)
-and use the container image (`slimerl/slime:latest`). Inside the
-container, slime and Megatron-LM ship pre-installed at `/root/slime`
-and `/root/Megatron-LM` — use those paths for `slime_dir` /
-`megatron_dir` on `SlimeRunner`.
-
-Install the toolkit with the slime-backend extras inside the container:
+From the repo root, in an activated Python 3.12 environment:
 
 ```bash
-uv pip install -e ".[slime]"
-```
-
-:::note
-We have only tested against official slime at commit
-[`fa3c990`](https://github.com/THUDM/slime/commit/fa3c990af6f18efd3fd9922698bf4bf4048d1263).
-:::
-
-### Option B: Bare-metal install script
-
-Install slime and its heavyweight dependency stack (Megatron-LM,
-Transformer Engine, Apex, flash-attn, sglang, torch_memory_saver)
-with the provided script, which clones slime + Megatron-LM into the
-current directory and applies slime's official patches. Run it inside
-your activated python environment.
-
-:::note
-Both CUDA 12.9 and CUDA 13 are supported. The following commands assume CUDA 13.0 is installed at `/usr/local/cuda-13.0`; adjust `CUDA_HOME` and `cu13` if yours differs.
-:::
-
-```bash
-uv pip install -e ".[slime]"
+uv venv --python 3.12 && source .venv/bin/activate
 export CUDA_HOME=/usr/local/cuda-13.0
-bash src/agentcore_rl_toolkit/backends/slime/scripts/install_slime.sh cu13
+bash src/agentcore_rl_toolkit/backends/slime/scripts/install_slime.sh
 ```
 
-Point `slime_dir` / `megatron_dir` on `SlimeRunner` at the `slime` and
-`Megatron-LM` directories the script cloned.
+The script installs the toolkit with the `gateway` extra, the cu13
+PyTorch stack (flash-attn, Transformer Engine, Apex, torch_memory_saver,
+Megatron-Bridge, sglang), clones Megatron-LM and slime into the current
+directory at pinned commits, and applies slime's official Megatron and
+sglang patches.
+
+## Configure
+
+The hooks read their settings from a YAML file passed with
+`--custom-config-path`; every key becomes an attribute on slime's `args`.
+Start from the example:
+
+```bash
+cd src/agentcore_rl_toolkit/backends/slime/examples/math_agent
+cp config.yaml.example config.yaml
+```
+
+```yaml
+agent_runtime_arn: "arn:aws:bedrock-agentcore:<region>:<account-id>:runtime/<runtime-name>-<id>"
+s3_bucket: "your-s3-bucket-name"
+
+exp_id: "gsm8k-grpo-train"      # defaults to the wandb group/project
+gateway_port: 9090              # 0 = auto-assign
+max_rollout_time: 900           # per-session rollout timeout (s)
+tps_limit: 5                    # ACR invocation TPS quota
+max_pool_connections: 10        # reused AWS client connections, not a concurrency cap
+```
+
+`agent_runtime_arn` and `s3_bucket` are required. Optional keys:
+`gateway_host` (defaults to the node's routable IP), `model_id` (defaults
+to `--hf-checkpoint`).
 
 ## Prepare data
 
 The training dataset is a JSONL file where each line is one rollout
-request. Every line has the shape:
+request:
 
 ```json
-{"prompt": "...", "metadata": { /* whatever your agent expects */ }}
+{"prompt": "...", "metadata": {"payload": { /* whatever your agent expects */ }}}
 ```
 
-- **`prompt`** — top-level string, used by slime for **length filtering** only.
-- **`metadata`** — copied **verbatim** as the `payload` dict your
-  `@rollout_entrypoint` function receives. Put every per-rollout
-  config the agent needs here (user prompt, ground-truth answer,
-  task IDs, repo URIs, etc.).
+- **`prompt`** — read by slime through `--input-key prompt` (length
+  filtering, positional bookkeeping). The agent does not see it.
+- **`metadata.payload`** — sent **verbatim** as the `payload` dict your
+  `@rollout_entrypoint` function receives. Put every per-rollout field the
+  agent needs here (user prompt, ground-truth answer, task IDs, etc.). A
+  row without a `payload` dict fails the rollout.
 
 Example (GSM8K):
 
 ```json
-{"prompt": "How many ...?", "metadata": {"prompt": "How many ...?", "answer": "42"}}
+{"prompt": "How many ...?", "metadata": {"payload": {"prompt": "How many ...?", "answer": "42"}}}
 ```
 
-## Launch training with `SlimeRunner`
+## Launch training
 
-[`SlimeRunner`](/agentcore-rl-toolkit/api/backends/slime/runner/) is
-the one and only entry point — a Python class that stops stale
-processes, starts a Ray head, submits the slime training job, and
-streams output. Defaults target **8 × H100** (`num_gpus=8`,
-`tp_size=2`, `rollout_gpus_per_engine=2`); tune them for your
-cluster.
+`examples/math_agent/train.sh` is a complete GSM8K GRPO launcher. It stops
+stale SGLang/Ray processes, applies the CUDA 13 environment fixes, starts a
+Ray head, and submits slime's `train.py` with the two hooks and your
+config. Defaults target **8 × H100** (`NUM_GPUS=8`, tensor parallel 2, two
+GPUs per rollout engine).
 
-```python
-from agentcore_rl_toolkit.backends.slime import SlimeRunner
-
-SlimeRunner(
-    exp_id="gsm8k-3b-smoke",
-    agent_runtime_arn="arn:aws:bedrock-agentcore:...",
-    s3_bucket="your-bucket-name",
-    model_dir="/path/to/Qwen2.5-3B-Instruct",
-    data_path="/path/to/gsm8k_tiny.jsonl",
-    model_type="qwen2.5-3B",
-).train(num_rollout=1)   # 1 = smoke test; bump to 100 for a real run
+```bash
+SLIME_DIR=/path/to/slime \
+MODEL_DIR=/path/to/Qwen3-0.6B \
+TRAIN_DATA_PATH=/path/to/gsm8k_train.jsonl \
+MODEL_TYPE=qwen3-0.6B \
+bash train.sh
 ```
 
-**Wandb** — set `WANDB_API_KEY` and `WANDB_ENTITY` in your
-environment (plus `wandb_project` / `wandb_group` on the
-constructor) to log a run. Unset env vars skip wandb entirely.
+| Variable | Meaning |
+|---|---|
+| `SLIME_DIR` | slime checkout (the one `install_slime.sh` cloned) |
+| `MODEL_DIR` | HF checkpoint, used for `--hf-checkpoint` and `--ref-load` |
+| `TRAIN_DATA_PATH` | training JSONL |
+| `VAL_DATA_PATH` | eval JSONL (defaults to `TRAIN_DATA_PATH`) |
+| `MODEL_TYPE` | slime model-arch script name under `$SLIME_DIR/scripts/models/` |
+| `CONFIG` | hook config YAML (defaults to `config.yaml` next to the script) |
+| `CKPTS_DIR` | checkpoint directory; **cleared at start** |
+| `NUM_GPUS` | GPUs on the node |
 
-**Config-file workflow** — dump kwargs to YAML and call
-`SlimeRunner.from_yaml("my_run.yaml")` instead.
+To adapt it to another agent, copy `train.sh`, change the slime
+training arguments (batch sizes, response length, learning rate, wandb
+project), and keep the three `--custom-*` flags.
 
-`SlimeRunner` exposes every field most experiments tune (cluster
-shape, training hyperparameters, per-rollout ACR limits,
-`extra_flags` for extra arguments to be directly passed to
-[SLIME](https://github.com/THUDM/slime)) as constructor arguments.
-See the
-[API reference](/agentcore-rl-toolkit/api/backends/slime/runner/) or
-`help(SlimeRunner)` for the full list.
+## Behavior notes
+
+- **Rewards are agent-owned.** The hook reads `rewards` from the agent's
+  returned dict (the last element if it is a list). If the agent omits
+  rewards, slime falls back to its own reward model hub; a non-numeric
+  reward raises.
+- **Failed rollouts don't fail the step.** A timeout or non-200 agent
+  result keeps any captured turns with reward 0; a rollout with no
+  captured turns becomes an aborted sample that slime removes from the
+  batch.
+- **Group normalization** runs only when `--advantage-estimator` is one of
+  `grpo`, `gspo`, `cispo`, `reinforce_plus_plus_baseline` and reward
+  normalization is enabled; otherwise rewards pass through unchanged.

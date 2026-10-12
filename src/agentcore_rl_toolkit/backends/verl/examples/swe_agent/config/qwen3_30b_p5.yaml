@@ -10,7 +10,7 @@ actor_rollout_ref:
     megatron:
       pipeline_model_parallel_size: 1
       tensor_model_parallel_size: 4
-      context_parallel_size: 1
+      context_parallel_size: 2
 
       override_transformer_config:
         # must recompute
@@ -25,11 +25,12 @@ actor_rollout_ref:
 
   rollout:
     tensor_model_parallel_size: 4
+    max_model_len: ${data.max_response_length}
 
     engine_kwargs:
       vllm:
         reasoning_parser: qwen3
         tool_call_parser: qwen3_coder
         max_model_len: ${data.max_response_length}
-        # 4M tokens = 94 requests @ 44K
-        max_num_seqs: 128
+        # 2.6M tokens = 59 requests @ 44K
+        max_num_seqs: 64

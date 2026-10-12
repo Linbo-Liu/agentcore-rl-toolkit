@@ -18,11 +18,12 @@ from ray.actor import ActorProxy
 from agentcore_rl_toolkit.aws_tools.ec2_monitor import EC2Monitor, start_ec2_monitor
 from agentcore_rl_toolkit.concurrency.priority_assigner import LocalPriorityAssigner
 from agentcore_rl_toolkit.concurrency.priority_semaphore import LocalPrioritySemaphore
-from agentcore_rl_toolkit.concurrency.rate_limiter import ACRRateLimiter
+from agentcore_rl_toolkit.concurrency.rate_limiter import LocalRateLimiter
 from agentcore_rl_toolkit.concurrency.ray_adapters import (
     RayPriorityAssigner,
     RayPrioritySemaphore,
     RayRateLimiter,
+    make_priority_semaphore,
 )
 from agentcore_rl_toolkit.rollout_session.lifecycle import RolloutSessionBounds
 
@@ -41,9 +42,6 @@ CONTAINER_PRIORITY_ASSIGNER = "container_priority_assigner"
 ROLLOUT_PRIORITY_ASSIGNER = "rollout_priority_assigner"
 SESSION_RATE_LIMITER = "session_create_rate_limiter"
 
-# headroom on the semaphore actors' async slots, which bound queued waiters not permits
-CONCURRENCY_SAFETY_MARGIN = 2
-
 
 @dataclasses.dataclass
 class RolloutSessionAgentLoopResources:
@@ -57,19 +55,8 @@ class RolloutSessionAgentLoopResources:
     rollout_semaphore: ActorProxy[LocalPrioritySemaphore]
     container_priority_assigner: ActorProxy[LocalPriorityAssigner]
     rollout_priority_assigner: ActorProxy[LocalPriorityAssigner]
-    session_rate_limiter: ActorProxy[ACRRateLimiter]
+    session_rate_limiter: ActorProxy[LocalRateLimiter]
     ec2_monitor: EC2Monitor | None
-
-
-def _max_concurrency(config: DictConfig) -> int:
-    """How many callers may be queued on a semaphore actor at once.
-
-    Sized as every trajectory of every in-flight batch plus margin. ``num_warmup_batches``
-    exists in all trainer modes, so non-async runs just get an over-generous ceiling.
-    """
-    trajectories_per_batch = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
-    batches_inflight = config.trainer.v1.separate_async.num_warmup_batches + 1
-    return trajectories_per_batch * batches_inflight * CONCURRENCY_SAFETY_MARGIN
 
 
 async def start_rollout_session_agent_loop_resources(
@@ -82,37 +69,20 @@ async def start_rollout_session_agent_loop_resources(
     """
     cfg: RolloutSessionAgentLoopConfig = instantiate(config.rollout_session_agent_loop, _convert_="all")
     bounds_cfg = cfg.rollout_session_bounds
-    max_concurrency = _max_concurrency(config)
 
     return RolloutSessionAgentLoopResources(
         # the V1 trainer sets no rollout priority, so each semaphore gets an assigner that
         # numbers groups in arrival order to give it something to order waiters by
-        rollout_semaphore=(
-            ray.remote(LocalPrioritySemaphore)
-            .options(
-                name=ROLLOUT_SEMAPHORE,
-                get_if_exists=True,
-                max_concurrency=max_concurrency,
-            )
-            .remote(value=bounds_cfg["rollout_concurrency"])
-        ),
+        rollout_semaphore=make_priority_semaphore(ROLLOUT_SEMAPHORE, bounds_cfg["rollout_concurrency"], 10_000),
         rollout_priority_assigner=(
             ray.remote(LocalPriorityAssigner).options(name=ROLLOUT_PRIORITY_ASSIGNER, get_if_exists=True).remote()
         ),
-        container_semaphore=(
-            ray.remote(LocalPrioritySemaphore)
-            .options(
-                name=CONTAINER_SEMAPHORE,
-                get_if_exists=True,
-                max_concurrency=max_concurrency,
-            )
-            .remote(value=bounds_cfg["container_concurrency"])
-        ),
+        container_semaphore=make_priority_semaphore(CONTAINER_SEMAPHORE, bounds_cfg["container_concurrency"], 10_000),
         container_priority_assigner=(
             ray.remote(LocalPriorityAssigner).options(name=CONTAINER_PRIORITY_ASSIGNER, get_if_exists=True).remote()
         ),
         session_rate_limiter=(
-            ray.remote(ACRRateLimiter)
+            ray.remote(LocalRateLimiter)
             .options(name=SESSION_RATE_LIMITER, get_if_exists=True)
             .remote(tps_limit=bounds_cfg["session_create_rate"])
         ),
@@ -125,12 +95,13 @@ async def _start_ec2_monitor(cfg: RolloutSessionAgentLoopConfig) -> EC2Monitor |
 
     A single poller avoids exhausting the EC2 API rate limit at rollout scale. Nothing calls
     into it, so it is a background task on the caller's event loop rather than its own actor.
+    It watches the backend's capacity provider, so it runs only for a backend that has one.
     """
-    backend_cfg = cfg.rollout_session_backend
-    if backend_cfg["backend"] != "agentcore" or cfg.ec2_monitor_poll_interval <= 0 or cfg.dynamodb_table is None:
+    capacity_provider_arn = cfg.rollout_session_backend.get("capacity_provider_arn")
+    if capacity_provider_arn is None or cfg.ec2_monitor_poll_interval <= 0 or cfg.dynamodb_table is None:
         return None
     return await start_ec2_monitor(
-        backend_cfg["capacity_provider_arn"],
+        capacity_provider_arn,
         cfg.dynamodb_table,
         poll_interval=cfg.ec2_monitor_poll_interval,
         region_name=cfg.aws_region,

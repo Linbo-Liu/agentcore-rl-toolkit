@@ -24,8 +24,8 @@ python rl_app.py
 
 Deploy the same entrypoint to AgentCore Runtime via the
 [Prepare agent for RL → Deploy](/agentcore-rl-toolkit/guides/agent-adaptation/)
-flow, then feed the resulting runtime ARN into
-[`SlimeRunner`](/agentcore-rl-toolkit/guides/slime-backend-setup/)
+flow, then feed the resulting runtime ARN into the
+[slime backend](/agentcore-rl-toolkit/guides/slime-backend-setup/)
 to train.
 
 ## What's in the example

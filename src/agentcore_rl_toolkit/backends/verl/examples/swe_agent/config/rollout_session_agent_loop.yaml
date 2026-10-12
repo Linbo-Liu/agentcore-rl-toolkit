@@ -15,9 +15,15 @@ rollout_session_agent_loop:
   # record the ec2 instance id of each session
   ec2_monitor_poll_interval: 60
 
+  # what a failed rollout contributes to training: raise | empty | inert_row
+  # (see RolloutSessionAgentLoopConfig -- each has a different cost, none is known to be best)
+  on_rollout_failure: raise
+
   task_kwargs:
     agent: "openhands"
     docker_image_namespace: "${oc.env:docker_image_namespace}"
+    # lets the agent see the tests it's graded on; grading resets them either way
+    test_patch_applied: false
 
   # passed as-is to the rollout gateway (get_or_start_gateway)
   rollout_gateway:
@@ -25,7 +31,6 @@ rollout_session_agent_loop:
     max_turns_per_sid: 1000
     # one record per trajectory reaches the trainer, so linearize history
     history_mode: "linear"
-    fork_threshold_tokens: 0
 
   # gateway defaults for turns the agent did not specify; verl's own
   # temperature/top_p/top_k override the same keys
@@ -45,8 +50,9 @@ rollout_session_agent_loop:
     # includes task-specific setup
     container_setup_timeout: 1200
 
-  # `backend` picks the implementation; only that backend's keys have to be set
+  # `backend` is the import path of the session class; the remaining keys are expanded
+  # into its constructor, so missing and unknown keys are errors
   rollout_session_backend:
-    backend: agentcore
+    backend: agentcore_rl_toolkit.rollout_session.agentcore_a2a_session.AgentCoreA2ASession
     agentcore_runtime_arn: "${oc.env:agentcore_runtime_arn}"
     capacity_provider_arn: "${oc.env:agentcore_capacity_provider_arn}"

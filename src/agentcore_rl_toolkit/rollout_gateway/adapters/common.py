@@ -31,7 +31,7 @@ from ..linear import LinearHealer
 from ..render import Renderer
 from ..sampling_backends.base import SamplingBackend
 from ..trace import BaseTrace, TraceRecord
-from ..trajectory import TrajectoryManager, TurnRecord
+from ..trajectory import TrajectoryManager
 
 __all__ = ["BaseAdapter", "Reply", "Session", "sid_from_bearer", "sid_from_body"]
 
@@ -112,6 +112,19 @@ def manager_finish_reason(tool_uses: list[dict], raw_finish: str) -> str:
     return "tool_calls" if tool_uses else (raw_finish or "stop")
 
 
+def context_limit_message(prompt_tokens: int, max_context_tokens: int) -> str:
+    """Describe an input that fills the model's context window.
+
+    The wording follows OpenAI-compatible endpoints so clients such as Litellm
+    can classify the response as a context-window error and reduce the input.
+    """
+    return (
+        f"This model's maximum context length is {max_context_tokens} tokens. "
+        f"However, your prompt contains {prompt_tokens} input tokens, which leaves no room for output tokens. "
+        "Please reduce the length of the messages."
+    )
+
+
 class BaseAdapter:
     """Base HTTP adapter: session lifecycle plus the shared one-turn pipeline.
 
@@ -133,7 +146,6 @@ class BaseAdapter:
         renderer: Renderer,
         tokenizer=None,
         max_turns_per_sid: int | None = None,
-        fork_threshold_tokens: int | None = None,
         history_mode: str = "tree",
         linear_on_nonlinear: str = "reset",
         healer: LinearHealer | None = None,
@@ -151,15 +163,11 @@ class BaseAdapter:
         self.closed: set[str] = set()
 
         # one manager shared across all sids (and across co-mounted adapters, when
-        # passed in); per-sid trees live inside it. fork_threshold_tokens left None
-        # means the manager uses its own default.
+        # passed in); per-sid trees live inside it.
         if manager is not None:
             self.manager = manager
         else:
-            mgr_kwargs: dict[str, int] = {}
-            if fork_threshold_tokens is not None:
-                mgr_kwargs["fork_threshold_tokens"] = fork_threshold_tokens
-            self.manager = TrajectoryManager(**mgr_kwargs)
+            self.manager = TrajectoryManager()
 
         # linear-history mode: heal re-tokenization drift at generation time so the
         # manager stays permanently CLEAN (one sample per session). See linear.py.
@@ -176,6 +184,7 @@ class BaseAdapter:
         # per-sid turn cap: return 429 to kill the run once exceeded
         self.max_turns_per_sid: int | None = max_turns_per_sid
         self._sid_turn_count: dict[str, int] = {}
+        self._warned_chat_template_kwargs = False
 
         # app may be shared across co-mounted adapters (one aiohttp app, many routes)
         self.app = app if app is not None else web.Application(client_max_size=64 * 1024 * 1024)
@@ -202,6 +211,10 @@ class BaseAdapter:
 
     def _build_reply(self, parsed, raw_finish: str, translated: list[dict], tools_schema: list[dict] | None) -> Reply:
         """Pack parsed model output into a Reply."""
+        raise NotImplementedError
+
+    def _context_limit_error(self, *, prompt_tokens: int, max_context_tokens: int) -> web.Response:
+        """Return this protocol's response when the input fills its context window."""
         raise NotImplementedError
 
     async def _respond(
@@ -348,9 +361,12 @@ class BaseAdapter:
         """
         body = await request.json()
         self._preprocess_body(body)
-        chat_template_kwargs = body.get("chat_template_kwargs")
-        if chat_template_kwargs is not None and not isinstance(chat_template_kwargs, dict):
-            return web.Response(status=400, text="chat_template_kwargs must be an object")
+        if body.get("chat_template_kwargs") and not self._warned_chat_template_kwargs:
+            self.logger.warning(
+                "Request-level chat_template_kwargs are ignored. "
+                "Configure chat_template_kwargs when initializing the gateway renderer."
+            )
+            self._warned_chat_template_kwargs = True
         sid = self._session_id(request, body)
         if sid in self.closed:  # session drained; refuse stragglers
             self.logger.debug("[%s] sid=%s request after session closed", self.log_prefix, sid)
@@ -368,29 +384,36 @@ class BaseAdapter:
             if self.healer is not None:
                 # linear mode: splice canonical served ids over the drifted re-render
                 # before generation (the healer does the render internally).
-                prompt_ids = self.healer.heal(sid, translated, tools_schema)
+                prompt_ids = await self.healer.heal(sid, translated, tools_schema)
             else:
-                prompt_ids = self.renderer.render(
+                prompt_ids = await self.renderer.render(
                     translated,
                     tools=tools_schema,
                     add_generation_prompt=True,
-                    **({"chat_template_kwargs": chat_template_kwargs} if chat_template_kwargs else {}),
                 )
 
+            if sid in self.closed:
+                return web.Response(status=503, text="session closed")
             sampling_params = _sampling_params(s, body, max_token_keys=self.max_token_keys, stop_keys=self.stop_keys)
-            # context-budget clamp (backend-neutral): if the prompt already exceeds the
-            # per-sid budget, short-circuit with an empty length-capped turn.
+            # Context-budget clamp (backend-neutral): an input that fills the
+            # per-sid budget cannot generate even one token. Report that as an
+            # input-context error, rather than fabricating a zero-token,
+            # length-capped completion that clients cannot distinguish from a
+            # normal empty model response.
             if s.max_context_tokens > 0:
                 remaining = s.max_context_tokens - len(prompt_ids)
                 if remaining <= 0:
                     self.logger.warning(
-                        "[%s] sid=%s prompt exceeds max_context_tokens (%d >= %d)",
+                        "[%s] sid=%s prompt fills max_context_tokens (%d >= %d)",
                         self.log_prefix,
                         sid,
                         len(prompt_ids),
                         s.max_context_tokens,
                     )
-                    turn = TurnRecord(prompt_ids=list(prompt_ids), output_ids=[], finish_reason="length")
+                    return self._context_limit_error(
+                        prompt_tokens=len(prompt_ids),
+                        max_context_tokens=s.max_context_tokens,
+                    )
                 else:
                     sampling_params["max_new_tokens"] = min(
                         int(sampling_params.get("max_new_tokens", remaining)), remaining

@@ -1,46 +1,41 @@
 """HfTemplateRenderer round-trip tests.
 
-Uses a tiny stub tokenizer (no transformers download) to assert the renderer calls
-apply_chat_template with the expected kwargs and decodes/parses output correctly. A
-real-tokenizer parity check lives in the Step 2 E2E path (against the live server).
+Rendering uses a locally built HF/Rust tokenizer, compared directly with HF's
+apply_chat_template. Parsing uses small stubs. Neither needs model downloads.
 The schema-derender path (recognized chat template -> tokenizer.parse_response) is
 covered in test_response_schemas.py; this module covers the two-stage fallback.
 """
 
+import asyncio
 import sys
+from unittest.mock import patch
 
 import pytest
+from tokenizers import Tokenizer, decoders, models, normalizers, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
 
+from agentcore_rl_toolkit.rollout_gateway import BaseTrace, LinearHealer, TrajectoryManager, TurnRecord
 from agentcore_rl_toolkit.rollout_gateway.parsing import parse_tool_uses
 from agentcore_rl_toolkit.rollout_gateway.render import HfTemplateRenderer, ParsedOutput
 
 
 class StubTokenizer:
-    def __init__(self):
-        self.last_kwargs = None
-
-    def apply_chat_template(self, messages, *, tools=None, tokenize=True, add_generation_prompt=True, return_dict=True):
-        self.last_kwargs = dict(
-            tools=tools, tokenize=tokenize, add_generation_prompt=add_generation_prompt, return_dict=return_dict
-        )
-        # deterministic: one id per message, +99 sentinel for the generation prompt
-        ids = [len(m.get("content") or "") for m in messages]
-        if add_generation_prompt:
-            ids.append(99)
-        # mirror the real API: the default dict form bundles extras the renderer
-        # must opt out of with return_dict=False
-        return ids if not return_dict else {"input_ids": ids, "attention_mask": [1] * len(ids)}
-
     def decode(self, ids, skip_special_tokens=False):
         return " ".join(str(i) for i in ids)
 
 
-def test_render_passes_expected_kwargs_and_returns_list():
-    tok = StubTokenizer()
+@pytest.mark.asyncio
+async def test_render_passes_expected_kwargs_and_returns_list(fast_tokenizer):
+    tok = fast_tokenizer
     r = HfTemplateRenderer(tok)
-    ids = r.render([{"role": "user", "content": "abc"}], tools=None, add_generation_prompt=True)
-    assert ids == [3, 99]
-    assert tok.last_kwargs == {"tools": None, "tokenize": True, "add_generation_prompt": True, "return_dict": False}
+    messages = [{"role": "user", "content": "abc"}]
+    expected = tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_dict=False)
+    with patch.object(tok, "apply_chat_template", wraps=tok.apply_chat_template) as template:
+        ids = await r.render(messages, tools=None, add_generation_prompt=True)
+    assert isinstance(ids, list) and ids == expected
+    template.assert_called_once_with(
+        messages, tools=None, tokenize=False, add_generation_prompt=True, return_dict=False
+    )
 
 
 def test_parse_no_tools_returns_plain_text():
@@ -176,27 +171,239 @@ def test_tool_parser_skipped_without_tools_schema():
     assert out.text == "body"
 
 
-class KwargsStubTokenizer(StubTokenizer):
-    """StubTokenizer that also records template kwargs (enable_thinking & co.)."""
+@pytest.mark.asyncio
+async def test_render_uses_initial_chat_template_kwargs(fast_tokenizer):
+    tok = fast_tokenizer
+    config = {"enable_thinking": False}
+    r = HfTemplateRenderer(tok, chat_template_kwargs=config)
+    config["enable_thinking"] = True
+    with patch.object(tok, "apply_chat_template", wraps=tok.apply_chat_template) as template:
+        await r.render([{"role": "user", "content": "abc"}])
+        assert template.call_args.kwargs["enable_thinking"] is False
+        await HfTemplateRenderer(tok).render([{"role": "user", "content": "abc"}])
+        assert "enable_thinking" not in template.call_args.kwargs
 
-    def apply_chat_template(self, messages, **kwargs):
-        self.template_kwargs = {
-            k: v for k, v in kwargs.items() if k not in ("tools", "tokenize", "add_generation_prompt", "return_dict")
-        }
-        return super().apply_chat_template(
-            messages,
-            **{k: v for k, v in kwargs.items() if k in ("tools", "tokenize", "add_generation_prompt", "return_dict")},
+
+@pytest.fixture
+def fast_tokenizer():
+    """Actual HF/Rust tokenizer, built locally without model downloads."""
+    vocab = {c: i for i, c in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))}
+    backend = Tokenizer(models.BPE(vocab=vocab, merges=[]))
+    backend.normalizer = normalizers.NFC()
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        pad_token="<pad>",
+        eos_token="<|im_end|>",
+        additional_special_tokens=["<|im_start|>", "<extra>"],
+        chat_template=(
+            "{% for m in messages %}{{ '<|im_start|>' + m.role + '\\n' + m.content + '<|im_end|>\\n' }}"
+            "{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}"
+            "{% if enable_thinking | default(false) %}{{ '<think>\\n' }}{% endif %}{% endif %}"
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_encoding_matches_hf(fast_tokenizer):
+    tok = fast_tokenizer
+    renderer = HfTemplateRenderer(tok, chat_template_kwargs={"enable_thinking": True})
+    messages = [{"role": "user", "content": "中文🙂 e\u0301 <extra>\r\n" * 100}]
+    expected = tok.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True, return_dict=False, enable_thinking=True
+    )
+    outputs = await asyncio.gather(*[renderer.render(messages) for _ in range(16)])
+    assert all(ids == expected for ids in outputs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "options",
+    [
+        {
+            "padding": False,
+            "truncation": False,
+            "continue_final_message": False,
+            "return_assistant_tokens_mask": False,
+            "return_tensors": None,
+            "tokenizer_kwargs": {"return_overflowing_tokens": False},
+        },
+        {"max_length": 8},  # HF ignores max_length when truncation/padding are off.
+        {"truncation": True, "max_length": 16},
+        {"truncation": "only_first", "max_length": 16},
+        {"padding": "max_length", "max_length": 256, "tokenizer_kwargs": {"padding_side": "left"}},
+        {"padding": True, "tokenizer_kwargs": {"pad_to_multiple_of": 64}},
+        {"tokenizer_kwargs": {"split_special_tokens": True}},
+        {"tokenizer_kwargs": {"text_pair": "another sequence"}},
+        {"continue_final_message": True},
+        {"continue_final_message": "content"},
+    ],
+)
+async def test_async_render_preserves_hf_options(fast_tokenizer, options):
+    renderer = HfTemplateRenderer(fast_tokenizer, chat_template_kwargs=options)
+    messages = [{"role": "user", "content": "中文 <extra> question"}, {"role": "assistant", "content": "prefill"}]
+    add_generation_prompt = not options.get("continue_final_message")
+    expected = fast_tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=add_generation_prompt, return_dict=False, **options
+    )
+    actual = await renderer.render(messages, add_generation_prompt=add_generation_prompt)
+    assert actual == expected
+    assert all(isinstance(token_id, int) for token_id in actual)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closer", ["<|im_end|>", "<extra>"])
+@pytest.mark.parametrize("tool_call", [False, True])
+async def test_delta_uses_real_history_and_only_encodes_new_text(fast_tokenizer, closer, tool_call):
+    tok = fast_tokenizer
+    # Message numbers make dummy history produce a different suffix. The closer
+    # is a template variable, so neither template identity nor im_end can be assumed.
+    tok.chat_template = (
+        "{{ tools | tojson }}\n"
+        "{% for m in messages %}{{ '<|im_start|>' + m.role + '#' + (loop.index|string) + '\\n' + m.content }}"
+        "{% if m.tool_calls is defined %}{{ '<tool_call>' }}{{ m.tool_calls | tojson }}{{ '</tool_call>' }}{% endif %}"
+        "{{ turn_end + '\\n' }}{% endfor %}"
+        "{% if add_generation_prompt %}"
+        "{{ '<|im_start|>assistant#' + ((messages|length + 1)|string) + '\\n' }}{% endif %}"
+    )
+    renderer = HfTemplateRenderer(tok, chat_template_kwargs={"turn_end": closer})
+    assistant = {"role": "assistant", "content": "Inspecting."}
+    if tool_call:
+        assistant["tool_calls"] = [{"type": "function", "function": {"name": "x", "arguments": {"b": 2, "a": 1}}}]
+    history = [
+        {"role": "system", "content": "Help."},
+        {"role": "user", "content": "OLD_HISTORY " * 1000},
+        assistant,
+    ]
+    new = [{"role": "tool", "content": "中文🙂 e\u0301\r\n"}, {"role": "tool", "content": "Second result."}]
+    kw = dict(tools=TOOLS, turn_end=closer, tokenize=True, return_dict=False)
+    old_ids = tok.apply_chat_template(history, add_generation_prompt=False, **kw)
+    full_ids = tok.apply_chat_template(history + new, add_generation_prompt=True, **kw)
+    with patch.object(renderer, "_encode", wraps=renderer._encode) as encode:
+        result = await renderer.render_delta(history, new, tools=TOOLS)
+    assert result is not None
+    close_ids, tail_ids = result
+    assert close_ids == tok.encode(closer + "\n", add_special_tokens=False)
+    assert tail_ids == full_ids[len(old_ids) :]
+    assert "tool#4" in tok.decode(tail_ids) and "assistant#6" in tok.decode(tail_ids)
+    # The expensive encoding stage must never see the stored long history.
+    assert encode.await_count > 0
+    assert all("OLD_HISTORY" not in call.args[0] for call in encode.call_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["", "<|im_end|>", "<|im_end|>\n"])
+async def test_delta_healing_preserves_multiturn_tokens_and_training_masks(fast_tokenizer, ending):
+    tok = fast_tokenizer
+    renderer = HfTemplateRenderer(tok)
+    full_renderer = HfTemplateRenderer(tok)
+    full_renderer.render_delta = None  # Exercise the existing full-history oracle.
+    healers = [LinearHealer(renderer), LinearHealer(full_renderer)]
+    managers = [TrajectoryManager() for _ in healers]
+    history = [{"role": "user", "content": "Inspect the project."}]
+    generated_ids = []
+    with patch.object(renderer, "render_delta", wraps=renderer.render_delta) as delta:
+        for i in range(3):
+            prompts = [await h.heal("s", history, None) for h in healers]
+            assert prompts[0] == prompts[1]
+            # Sampled text deliberately differs from the parsed/replayed message.
+            output = tok.encode(f"Actually generated  {i}" + ending, add_special_tokens=False)
+            generated_ids.extend(output)
+            response = {"role": "assistant", "content": f"Canonical message {i}"}
+            for h, manager, prompt in zip(healers, managers, prompts, strict=True):
+                h.commit(
+                    "s",
+                    fed_prompt_ids=prompt,
+                    output_ids=output,
+                    messages=history,
+                    response_message=response,
+                    tools=None,
+                )
+                manager.record_turn(
+                    "s",
+                    turn=TurnRecord(
+                        prompt_ids=prompt,
+                        output_ids=output,
+                        output_log_probs=[-0.1 * (i + 1)] * len(output),
+                        finish_reason="stop",
+                    ),
+                    prompt_messages=history,
+                    response_message=response,
+                )
+            history = history + [response, {"role": "tool", "content": f"Tool result {i}"}]
+    assert delta.await_count == 2
+    rows = [m.get_trajectory("s", base_sample=BaseTrace(), reward=1) for m in managers]
+    assert rows[0] == rows[1]
+    assert len(rows[0]) == 1
+    record = rows[0][0]
+    response_ids = record.token_ids[-len(record.loss_mask) :]
+    assert [tid for tid, mask in zip(response_ids, record.loss_mask, strict=True) if mask] == generated_ids
+    assert all(h.counters["nonlinear"] == 0 for h in healers)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["prefix_changed", "closer_changed"])
+async def test_delta_declines_unsafe_template_and_preserves_fallback(fast_tokenizer, reason):
+    tok = fast_tokenizer
+    if reason == "prefix_changed":
+        tok.chat_template = "{{ messages | length }}\n" + tok.chat_template
+    else:
+        tok.chat_template = tok.chat_template.replace(
+            "'<|im_end|>\\n'", "('<extra>\\n' if m.tool_calls is defined else '<|im_end|>\\n')"
         )
+    renderer = HfTemplateRenderer(tok)
+    oracle = HfTemplateRenderer(tok)
+    oracle.render_delta = None
+    prior = [{"role": "user", "content": "q"}]
+    last = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{"type": "function", "function": {"name": "x", "arguments": {}}}],
+    }
+    new = [{"role": "tool", "content": "result"}]
+    assert await renderer.render_delta(prior + [last], new) is None
+    seed = await renderer.render(prior)
+    healers = [LinearHealer(r) for r in (renderer, oracle)]
+    results = []
+    for h in healers:
+        h.commit("s", fed_prompt_ids=seed, output_ids=[42], messages=prior, response_message=last, tools=None)
+        results.append(await h.heal("s", prior + [last] + new, None))
+    assert results[0] == results[1]
+    assert healers[0].counters == healers[1].counters
+    assert healers[0].counters["nonlinear"] == 1
 
 
-def test_render_forwards_chat_template_kwargs_renderer_default_and_per_call():
-    tok = KwargsStubTokenizer()
-    r = HfTemplateRenderer(tok, chat_template_kwargs={"enable_thinking": False})
-    r.render([{"role": "user", "content": "abc"}])
-    assert tok.template_kwargs == {"enable_thinking": False}
-    # a per-call value (the request body's chat_template_kwargs) wins over the renderer default
-    r.render([{"role": "user", "content": "abc"}], chat_template_kwargs={"enable_thinking": True, "x": 1})
-    assert tok.template_kwargs == {"enable_thinking": True, "x": 1}
-    # no kwargs anywhere -> nothing extra reaches the tokenizer (stock behaviour)
-    HfTemplateRenderer(tok).render([{"role": "user", "content": "abc"}])
-    assert tok.template_kwargs == {}
+@pytest.mark.asyncio
+async def test_delta_keeps_served_prefix_when_bpe_can_merge_across_boundary():
+    vocab = {c: i for i, c in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))}
+    vocab["ĊĊ"] = len(vocab)  # ByteLevel's representation of two newlines.
+    backend = Tokenizer(models.BPE(vocab=vocab, merges=[("Ċ", "Ċ")]))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    tok = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        eos_token="<|im_end|>",
+        additional_special_tokens=["<|im_start|>"],
+        chat_template=(
+            "{% for m in messages %}{{ '\\n<|im_start|>' + m.role + '\\n' + m.content + '<|im_end|>\\n' }}"
+            "{% endfor %}{% if add_generation_prompt %}{{ '\\n<|im_start|>assistant\\n' }}{% endif %}"
+        ),
+    )
+    r = HfTemplateRenderer(tok)
+    h = LinearHealer(r)
+    prior = [{"role": "user", "content": "q"}]
+    last = {"role": "assistant", "content": "answer"}
+    new = [{"role": "tool", "content": "result"}]
+    seed = await h.heal("s", prior, None)
+    output = tok.encode("answer<|im_end|>", add_special_tokens=False)
+    h.commit("s", fed_prompt_ids=seed, output_ids=output, messages=prior, response_message=last, tools=None)
+    actual = await h.heal("s", prior + [last] + new, None)
+    full = await r.render(prior + [last] + new)
+    # Separate newline tokens decode identically to the full encoder's merged
+    # newline token. This alone must not discard the actual generated prefix.
+    assert actual != full
+    assert tok.decode(actual) == tok.decode(full)
+    assert actual[: len(seed + output)] == seed + output
+    assert h.counters["healed_turns"] == 1
+    assert h.counters["nonlinear"] == 0

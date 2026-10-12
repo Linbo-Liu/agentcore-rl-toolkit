@@ -28,14 +28,17 @@ cd examples/strands_math_agent && uv sync && uv run python rl_app.py
 | File | Purpose |
 |------|---------|
 | `src/agentcore_rl_toolkit/app.py` | `AgentCoreRLApp` base class, `@rollout_entrypoint` decorator |
+| `src/agentcore_rl_toolkit/runtime/` | `AgentCoreRuntimeApp`: optional HTTP `start/get` invocation lifecycle with filesystem records |
 | `src/agentcore_rl_toolkit/client.py` | `RolloutClient` and `RolloutFuture` for training integration and batch evaluation |
 | `src/agentcore_rl_toolkit/reward_function.py` | `RewardFunction` base class |
 | `src/agentcore_rl_toolkit/rollout_gateway/` | In-repo token-level trajectory capture layer: `RolloutGateway`, `Renderer`, `SamplingBackend`, `TraceRecord` (see [Rollout Gateway](#rollout-gateway)) |
 | `src/agentcore_rl_toolkit/backends/experimental/verl/` | Experimental verl extras that have not graduated into `backends/verl/`: `RolloutSessionAgentLoop` (sandbox-session rollouts, used by the SWE agent example), its task runner, and trainer mixins |
 | `src/agentcore_rl_toolkit/backends/experimental/sagemaker/` | Experimental SageMaker Training Sessions backend: single-process GRPO loop (`train_grpo.py`) over the rollout gateway, no local GPUs |
 | `src/agentcore_rl_toolkit/backends/verl/` | verl backend: `AgentCoreAgentLoop` plugged into verl's standard main_ppo entrypoint via the rollout gateway |
-| `src/agentcore_rl_toolkit/sandbox/` | Sandbox SDK: `SandboxClient`, `Sandbox`, `ExecResult` — run shell commands in arbitrary images on ACR (see [Sandbox SDK](#sandbox-sdk)) |
-| `sandboxd/` | Go health shim (`agentcore-sandboxd`) that makes arbitrary Docker images satisfy the ACR container contract |
+| `src/agentcore_rl_toolkit/backends/tinker_api/` | CPU training loop over a Tinker-compatible endpoint, with HF rendering and synchronous group-relative updates |
+| `src/agentcore_rl_toolkit/backends/slime/` | slime backend: `generate` + `normalize_episode_rewards` hooks for slime's `--custom-generate-function-path` / `--custom-reward-post-process-path` (see [slime backend](#slime-backend-backendsslime)) |
+| `src/agentcore_rl_toolkit/sandbox/` | Sandbox SDK: `SandboxClient`, `Sandbox`, `ExecResult` — run programs in arbitrary images on ACR (see [Sandbox SDK](#sandbox-sdk)) |
+| `sandboxd/` | Go daemon (`agentcore-sandboxd`) for session health and recoverable command execution |
 | `examples/strands_math_agent/` | GSM8K math agent example |
 | `examples/strands_migration_agent/` | Java migration agent example |
 | `examples/strands_officebench_agent/` | OfficeBench office automation agent example |
@@ -99,6 +102,28 @@ On the client side, `RolloutClient` and `RolloutFuture` are the complement to th
 
 #### Core Classes
 
+**AgentCoreRuntimeApp** (`src/agentcore_rl_toolkit/runtime/`)
+- Exported from `agentcore_rl_toolkit`; retains `@app.entrypoint` and ordinary HTTP behavior.
+- `background=True` runs requests without `_agentcore_runtime` in the background
+  with generated invocation IDs; ordinary retries may execute again. Explicit
+  envelopes retain their protocol behavior. See the
+  [SageMaker RFT example](designs/agentcore_runtime_app.md#sagemaker-rft-example)
+  and [integration tests](tests/runtime/test_sagemaker_rft.py).
+- Requests with `_agentcore_runtime` use versioned `start/get`, foreground/background execution, and session-scoped invocation IDs.
+- Records live under configurable `state_dir`, defaulting to `.agentcore_runtime` under the OS temporary directory (`TMPDIR`).
+- One app process serves one Runtime session; live tasks are keyed by invocation ID. Filesystem records retain session-specific paths; use a managed mount for stop/resume persistence.
+- Protocol handlers return JSON values; terminal errors use an `error` string. Terminal errors, `interrupted`, and `not_found` are HTTP 200 states, while storage failures are operation errors.
+- `AgentCoreHttpClient` drives this app; the existing `RolloutClient` still uses S3. See [the app design](designs/agentcore_runtime_app.md) for HTTP mapping and implementation decisions, and [RIP](designs/runtime_invocation_protocol.md) for the shared lifecycle contract.
+- `AgentCoreHttpClient.invoke()` returns a foreground result or a background `InvocationHandle`.
+  `AgentCoreHttpSession` owns per-rollout cleanup;
+  the Tinker backend uses it with flat task payloads and singular `reward`.
+- Tests: `uv run pytest tests/runtime/`.
+- Live tests: deploy `tests/runtime/live_agent.py` with the checkout's package,
+  the HTTP contract, and `idleRuntimeSessionTimeout=60`, then run
+  `RUNTIME_TEST_ARN=arn:... uv run pytest tests/runtime/test_live.py`.
+  Without the ARN they skip. Each test stops its own sessions; the Runtime stays
+  deployed for reuse. The agent needs no model, S3, or managed session storage.
+
 **AgentCoreRLApp** (`src/agentcore_rl_toolkit/app.py`)
 - Inherits `BedrockAgentCoreApp` - drop-in replacement
 - Provides `@app.rollout_entrypoint` decorator
@@ -115,8 +140,7 @@ On the client side, `RolloutClient` and `RolloutFuture` are the complement to th
 
 `src/agentcore_rl_toolkit/rollout_gateway/` is an in-repo, backend-agnostic layer that
 captures **token-level, loss-maskable trajectories** from agent rollouts for RL training.
-It is the successor to the `rllm-model-gateway` dependency used by the current
-`backends/{slime,verl}` integrations.
+It is used by the toolkit's `backends/{slime,verl,tinker_api}` integrations.
 
 **Why it exists.** RL training needs per-token ids, logprobs, and a loss mask for every
 model turn — not just the final text. The gateway captures these transparently: an agent
@@ -135,8 +159,8 @@ sample-only backends like Tinker, which cannot render themselves.
 | Component | File | Role |
 |---|---|---|
 | `TraceRecord` | `trace.py` | Torch-free output: `token_ids`, `loss_mask`, `logprobs`, `reward`, `rollout_id`. Each training backend converts this to its native sample type in its own process. |
-| `TrajectoryManager` | `trajectory.py` | Per-session message **tree**. Handles multi-turn concatenation, parallel tool-call branches, and heals re-tokenization drift between turns (CLEAN / REALIGN / FORK). Tokenizer-free and torch-free. |
-| `Renderer` | `render.py` | Tokenization seam. `HfTemplateRenderer` (default, HF `apply_chat_template`) or `TinkerRenderer` (needs `tinker-cookbook`, installed manually). |
+| `TrajectoryManager` | `trajectory.py` | Per-session message **tree**. Handles multi-turn concatenation and parallel tool-call branches; re-tokenization drift splits records while preserving generated tokens (CLEAN / FORK). Tokenizer-free and torch-free. |
+| `Renderer` | `render.py` | Tokenization seam. `HfTemplateRenderer` (HF `apply_chat_template`), shared by all sampling backends. |
 | `SamplingBackend` | `sampling_backends/` | The one per-engine seam: `token_ids -> token_ids + logprobs` as a `TurnRecord`. Impls: `VllmHttpBackend`, `SglangHttpBackend`, `TinkerSdkBackend`, `SageMakerSdkBackend`. Placement rule: engine seams for independently reachable inference services (HTTP endpoints, hosted SDKs like Tinker and SageMaker) live here; seams over trainer-internal handles (e.g. `VerlSamplingBackend` over verl's Ray-based `LLMServerClient`) live with that trainer's integration under `backends/`. |
 | Adapters | `adapters/` | Wire-protocol translation: `OpenAIAdapter` (`/v1/chat/completions`), `AnthropicAdapter` (`/v1/messages`). An agent drives the gateway in its *native* protocol unmodified (just point `base_url` at it); both normalize to one canonical message form and share one `TrajectoryManager`. |
 | `RolloutGateway` | `gateway.py` | Assembles tokenizer + renderer + backend + adapters onto one aiohttp app sharing one `TrajectoryManager`. Session identity rides in the api-key / Bearer slot; `base_url` is a fixed gateway address (no per-session URLs). |
@@ -179,16 +203,18 @@ drains the tree into `list[TraceRecord]`.
   would silently miss every other; opt into it explicitly with
   `tool_parser=parse_tool_uses`); the gateway itself never imports an inference
   engine. Injecting a `reasoning_parser` / `tool_parser` callable into
-  `HfTemplateRenderer` disables schema detection and takes full control — the intended
-  hook for a backend that wants to reuse its own engine's detectors (e.g. SGLang's
-  `FunctionCallParser` + `ReasoningParser`, importable wherever the trainer serves
-  SGLang).
-- For the Tinker backend (`TinkerSdkBackend` + `TinkerRenderer`), install `tinker` and
-  `tinker-cookbook` manually — they are not declared as an extra. Both pull torch. (The
-  original reason no longer applies: they require Python ≥3.11, which was unsatisfiable
-  when this package's floor was ≥3.10. The floor is now ≥3.11.)
+  `HfTemplateRenderer` disables schema detection and takes full control. The slime
+  backend (`backends/slime/`) uses the default schema-based parsing (`HfTemplateRenderer` with no custom parsers); injecting the same
+  SGLang-native parsers via the `reasoning_parser` / `tool_parser` kwargs is a natural
+  extension if tool-bearing or reasoning-bearing models are served.
+- For Tinker API training (`backends/tinker_api/`), install `[gateway,tinker_api]`
+  for the official service or `[gateway,tinker_skyrl]` for the tested SkyRL version.
+  `TinkerSdkBackend` uses the Tinker SDK for token sampling and the gateway uses
+  `HfTemplateRenderer`. SkyRL and its GPU dependencies live in a separate service
+  environment. The synchronous recipe and instructions for connecting to an existing endpoint are in
+  `src/agentcore_rl_toolkit/backends/tinker_api/README.md`.
 - For the SageMaker backend (`SageMakerSdkBackend`), install the Training Sessions SDK
-  manually (`pip install sagemaker-train`) — not declared as an extra. Unlike the other
+  (`uv sync --group sagemaker-integration`, or `pip install sagemaker-train`). Unlike the other
   sampling backends it imports `sagemaker.train.training_session` at module scope, so the
   module is only importable with the SDK present; nothing else in the gateway imports it.
 
@@ -196,11 +222,20 @@ The core (`TraceRecord`, `TrajectoryManager`, `Renderer` protocol, `SamplingBack
 protocol) imports torch-free and aiohttp-free; `RolloutGateway` is exposed lazily so
 importing the package never requires aiohttp. Tests live in `tests/rollout_gateway/`.
 
-**Status.** The capture layer above is implemented and tested. Its training-backend
-consumers are the **verl backend** (`backends/verl/`) and the **experimental SageMaker
-backend** (`backends/experimental/sagemaker/`), both below; the remaining backends'
-dispatch/reward-join glue is not yet on the main branch — a prototype dispatcher is
-parked on the `wip/online-rl-dispatch` branch.
+**Status.** The capture layer above is implemented and tested. Training-backend consumers:
+the **verl backend** (`backends/verl/`, see below), the **Tinker API backend**
+(`backends/tinker_api/`), the **slime backend**
+(`backends/slime/`, see below), and the **experimental SageMaker backend**
+(`backends/experimental/sagemaker/`, see below). Other
+backends' dispatch/reward-join glue is not yet on the main branch — a prototype
+dispatcher is parked on the `wip/online-rl-dispatch` branch.
+
+### External Integrations
+
+[rLLM natively integrates with AgentCore Runtime](https://docs.rllm-project.com/agent-runtimes/agentcore).
+rLLM maintains its installation, configuration, training, and troubleshooting
+instructions upstream. This repository provides agent adaptation and deployment
+guides; its training integrations and rollout gateway are maintained separately.
 
 ### verl backend (`backends/verl/`)
 
@@ -214,7 +249,7 @@ GRPO against **Amazon SageMaker Training Sessions**: SageMaker hosts the policy 
 the sampler, and the optimizer behind an SDK, so **no local GPU cluster is needed** — the
 RL loop is a single-process asyncio program driven by one YAML config. Contrast with
 slime/verl, where the trainer owns the GPUs and the gateway is embedded in it. Requires
-the `sagemaker-train` wheel (installed manually, see above); user-facing setup lives in
+the `sagemaker-train` wheel (see above); user-facing setup lives in
 `SETUP.md` and `docs/site/src/content/docs/guides/sagemaker-backend-setup.md`.
 
 Key pieces:
@@ -249,7 +284,7 @@ Key pieces:
   over the prompt span). Returns `None` for an empty or all-zero loss mask; a step with no
   valid datums is skipped rather than submitted. The loss mask is applied to `advantages`
   as well as `weights`: masked positions inside the response span (tool results, user
-  turns, REALIGN-overwritten drift) carry a stored logprob of `0.0`, so a service-side
+  turns) carry a stored logprob of `0.0`, so a service-side
   surrogate that consulted only `advantages` would score them against a fabricated old
   policy. Whether all four `lossFn` values honor `weights` is not observable from the
   client SDK (it ships `lossFnName` + datums and does no loss math), so the datum is made
@@ -276,92 +311,118 @@ cannot work; failures surface as rollouts scored `0.0`, not as a crash, because
 `run_one_rollout()` logs and returns a zero reward. Documented under "Networking" in
 `docs/site/src/content/docs/guides/sagemaker-backend-setup.md`.
 
-**Vendored from upstream projects (baselines).** Several files are adapted from
-[slime](https://github.com/THUDM/slime) and [trl](https://github.com/huggingface/trl)
-(both Apache-2.0; see `NOTICE`). To check what changed upstream before re-syncing, diff
-the source against the baseline commit below:
+**Vendored response schemas.** The response-schema registry is adapted from
+[trl](https://github.com/huggingface/trl) (Apache-2.0; see `NOTICE`).
 
 | This repo | upstream source | Baseline commit |
 |---|---|---|
-| `rollout_gateway/trajectory.py` | `slime/agent/trajectory.py` | `90c212b5` |
-| `rollout_gateway/adapters/{common,openai,anthropic}.py` | `slime/agent/adapters/` | `90c212b5` |
-| `rollout_gateway/parsing.py` | `slime/agent/parsing.py` | `90c212b5` |
-| `rollout_gateway/server.py` | `slime/agent/aiohttp_threaded.py` | `fa3c990a` |
 | `rollout_gateway/response_schemas.py` | `trl/chat_template_utils.py` (schema dicts) + `trl/chat_templates/*.jinja` (hash table) | `7073af94` |
-
-Re-sync workflow: `git -C <slime> diff 90c212b5..HEAD -- slime/agent/<file>` shows upstream
-changes since the lift (same pattern for trl). Our copies are intentionally modified
-(torch-free; `Sample` → `TraceRecord`; injected backend/renderer seams; sglang parser hook
-removed), so treat the diff as a review aid, not an automatic merge.
-
-`adapters/openai.py` additionally returns the assistant's text alongside `tool_calls`
-and every parallel call, where upstream sends `content=null` and only the first call.
-Do not re-adopt upstream's shape: it costs the agent its own text in the replayed
-history, and the replayed history then no longer reproduces the sampled tokens (see the
-mixed text + parallel tool-call test in
-`tests/rollout_gateway/test_gateway_integration.py`).
 
 For `response_schemas.py`, re-sync means updating the schema dicts and recomputing the
 sha256 hashes of the covered chat templates — preserving the marked local-additions
 block at the end of `_TEMPLATE_HASHES` (templates with no TRL equivalent, e.g.
 Qwen3-Coder → `qwen3_5`). Bump the baseline commit here when you re-sync.
 
-### Sandbox SDK
+### slime backend (`backends/slime/`)
 
-`src/agentcore_rl_toolkit/sandbox/` runs shell commands in **arbitrary Docker images**
-(e.g. SWE-bench-style coding environments) deployed as ACR runtimes — the substrate for
-coding-agent evaluation and RL rollouts.
+Plugs into [slime](https://github.com/THUDM/slime) (Megatron-LM + SGLang GRPO trainer)
+via two hook entry points, requiring no changes to slime itself:
 
-**How it works.** Most coding-environment images are not HTTP agent servers, but ACR
-requires containers to expose `/ping` and `/invocations` on port 8080. The bridge is
-`agentcore-sandboxd` (Go, stdlib-only, source in `sandboxd/`): a health shim added to the
-image that manages the Healthy/HealthyBusy ping state. Command execution does NOT go
-through the shim — the client uses ACR's native `InvokeAgentRuntimeCommand` API, which
-runs shell commands in the same session/container and streams back stdout/stderr/exit code.
+- `--custom-generate-function-path agentcore_rl_toolkit.backends.slime.integration.rollout.generate`
+- `--custom-reward-post-process-path agentcore_rl_toolkit.backends.slime.integration.rewards.normalize_episode_rewards`
+- `--custom-config-path /path/to/config.yaml` (see `examples/math_agent/config.yaml.example`)
 
-```python
-from agentcore_rl_toolkit.sandbox import SandboxClient
+**Key pieces:**
 
-client = SandboxClient(runtime_arn="arn:aws:bedrock-agentcore:...:runtime/...")
-with client.start() as sb:                      # session starts, ping -> HealthyBusy
-    result = sb.exec("cd /app && pytest -q", timeout=900)
-    result.exit_code, result.stdout, result.stderr, result.timed_out
-# __exit__ -> terminate(): ping -> Healthy, then StopRuntimeSession
-sb = client.attach(session_id)                  # reconnect to a live session
-```
+- `integration/rollout.py` — `AgentCoreRLConfig` (dataclass read from the YAML),
+  `AgentCoreRLService` (singleton: one `RolloutGateway` + `ThreadedGatewayServer` +
+  `RolloutClient` per process), and `generate(args, sample, sampling_params)` — the
+  per-sample hook. Creates a gateway session keyed by a fresh `uuid4` (= ACR
+  `runtimeSessionId` = api-key for trajectory capture), calls `RolloutClient.invoke_async`
+  with the session id, awaits the S3 result, drains `gateway.finish_session` into
+  `TraceRecord`s, and maps each record to a slime `Sample`. Rollout failures
+  (timeout, non-200, empty trajectory) return an `ABORTED` sample with `remove_sample=True`
+  rather than raising — slime drops those rows from the batch.
+- `integration/rewards.py` — `normalize_episode_rewards(args, samples)`: GRPO group
+  normalization that stays correct when one rollout forks into multiple trajectory
+  leaves. Slime's built-in normalizer groups positionally (reshape to `(-1, n_samples_per_prompt)`),
+  which is wrong for forked rows. This groups by `group_index`, dedups by `rollout_id`,
+  and normalizes within each group's unique rollouts. Active only when
+  `advantage_estimator` is in `(grpo, gspo, cispo, reinforce_plus_plus_baseline)` and
+  `rewards_normalization=True`; returns identity otherwise.
+- `integration/rollout.py:_agent_reward` — rewards are agent-owned (inline `{"rewards": ...}`
+  in the S3 result). `None` is returned when the agent omits rewards, signalling slime to
+  fall back to its own `rm_hub`; a non-numeric reward raises (broken agent-side code
+  would silently zero every group).
 
-**Key semantics:**
+**Dataset contract.** Each slime dataset row must carry the ACR invocation payload in its
+`metadata.payload` field (a dict). Slime's `--input-key prompt` supplies the conversation
+for the positional advantage estimator; the actual agent input lives in `metadata.payload`.
 
-- **Nonzero exit and timeout are data, not exceptions** (`ExecResult.exit_code`,
-  `ExecResult.timed_out` with partial output). Exceptions are reserved for infrastructure
-  failures: `ClientError`/`EventStreamError` propagate; `SandboxProtocolError` means the
-  deployed container isn't behaving like sandboxd (wrong image) or the stream was invalid.
-- **Commands are stateless** — each `exec()` runs in a fresh process. `cwd=`/`env=` params
-  are composed into the command string per call (`cd ... && export ... && <command>`).
-- **The command API does not invoke a shell itself** (it word-splits argv-style), so the
-  client wraps every command in `<shell> -c '...'` on the wire — default `/bin/sh` for
-  arbitrary-image portability, overridable via `SandboxClient(shell=...)`/`exec(shell=...)`.
-  Users just write shell strings; pipes, `;`, and `$VAR` work.
-- **Verbs**: `start`/`attach`/`terminate` are the per-session data plane. `create` is
-  reserved for future control-plane provisioning (`CreateAgentRuntime` from an ECR image).
-- `terminate()` is idempotent and best-effort: it flips the ping to Healthy first so the
-  idle reaper collects the session even if `StopRuntimeSession` fails.
-- The base image must contain a shell (`InvokeAgentRuntimeCommand` executes shell
-  commands); scratch/distroless images won't work.
-- Sync-only today. Planned next phases: TTL leak protection + async client (aiobotocore),
-  then detached exec (`spawn`/`ExecHandle`), interactive shells, file transfer.
-
-**Building the shim binary** (static, cross-compiled; works on x86 hosts, falls back to a
-golang container if Go isn't installed):
+**Installation.**
 
 ```bash
-sandboxd/build.sh                 # -> sandboxd/dist/agentcore-sandboxd-linux-arm64
-sandboxd/build.sh --stage examples/sandbox_quickstart   # also copy into a build context
+bash src/agentcore_rl_toolkit/backends/slime/scripts/install_slime.sh
 ```
 
-See `examples/sandbox_quickstart/` for the full walkthrough (wrap image → push to ECR →
-create runtime → run). Python tests: `tests/sandbox/` (boto3 fully mocked). Go tests:
-`cd sandboxd && go test -race ./...` (CI: `.github/workflows/sandboxd.yml`).
+Requires CUDA 13 (`CUDA_HOME=/usr/local/cuda-13.0`). The script installs: cu13 PyTorch +
+flash-attn, mbridge, transformer-engine-cu13, apex, torch_memory_saver, Megatron-Bridge,
+nvidia-modelopt, sglang, and clones + installs slime + Megatron-LM from source.
+
+**Running (GSM8K example).**
+
+```bash
+cd src/agentcore_rl_toolkit/backends/slime/examples/math_agent
+cp config.yaml.example config.yaml  # fill in agent_runtime_arn + s3_bucket
+SLIME_DIR=... MODEL_DIR=... TRAIN_DATA_PATH=... MODEL_TYPE=... bash train.sh
+```
+
+See `examples/math_agent/SETUP.md` for the full walkthrough.
+
+**CUDA 13 quirks** (handled inside `train.sh`):
+- `torch_memory_saver` compiles with a `_cu13` suffix but slime's actor group hardcodes
+  `_cu12` — `train.sh` symlinks the cu13 `.so` to the cu12 name at runtime.
+- `/usr/local/cuda` → `cuda-12.*` confuses TE's cuDNN-frontend into loading two
+  `libcudart` versions ("Multiple libcudart found"). `train.sh` redirects `CUDA_HOME` to
+  `cuda-13.0`, strips cu12 paths from `LD_LIBRARY_PATH`, and drops an empty
+  `libcudart.so.12` decoy so the cu12 resolver finds nothing real.
+- `CUDNN_FRONTEND_CUDART_LIB_NAME=libcudart.so.13` makes standalone cudnn-frontend ≥1.26
+  skip the libcudart probe entirely.
+- Megatron train actors get a separate Ray `runtime_env` that drops `CUDA_HOME`/`CUDNN_*`/
+  `LD_LIBRARY_PATH`; `--train-env-vars` re-pins them for those actors.
+
+### Sandbox SDK
+
+The Sandbox SDK executes argv lists in arbitrary images on AgentCore Runtime.
+The Python client calls an independent Go daemon inside each sandbox.
+
+**Code entry points:**
+
+- `src/agentcore_rl_toolkit/sandbox/`: `client.py` owns session and execution handles;
+  `types.py` defines result types.
+- `sandboxd/main.go`: HTTP/session dispatch; `process.go`: execution; `store.go`: records.
+
+**Key constraints:**
+
+- Execution ownership is independent of HTTP connections. Retries reuse invocation
+  IDs, `get` never executes work, and terminal results are persisted before completion.
+- Completion waits for process exit and output EOF. Execution timeout kills only the
+  direct process; descendants may survive until session termination.
+- Execution timeout raises `ExecTimeoutError` with the persisted result. Local
+  `ExecHandle.result(timeout=...)` timeout raises `TimeoutError` and leaves work running.
+
+See the [SDK design](designs/sandbox_sdk.md) for API semantics and decisions,
+the [daemon README](sandboxd/README.md) for wire format and configuration, and
+the [quickstart](examples/sandbox_quickstart/README.md) for deployment and usage.
+
+```bash
+sandboxd/build.sh --stage examples/sandbox_quickstart
+uv run pytest tests/sandbox/
+(cd sandboxd && go test -race ./...)
+```
+
+Live ACR tests require `SANDBOX_RUNTIME_ARN`. Go CI runs in
+`.github/workflows/sandboxd.yml`.
 
 ### Migration Guide (basic_app → rl_app)
 
@@ -582,11 +643,24 @@ uv pip install -e ../../ --force-reinstall --no-deps
 - GitHub pull request descriptions must not hard-wrap prose at a fixed column width. Write each Markdown paragraph as one physical line, regardless of length, and let GitHub handle visual wrapping.
 - In pull request descriptions, insert newlines only for Markdown structure: paragraph boundaries, headings, list items, blockquotes, tables, code blocks, and similar constructs.
 - This pull request formatting rule does not apply to git commit messages or repository documentation; follow their existing wrapping conventions.
-- When implementing or changing behavior covered by a document in `designs/`, update that document and its `Implementation` status in the same change.
+- When implementing or changing behavior covered by a document in `designs/`, update the relevant design content in the same change. Do not change its `Implementation` status unless explicitly requested.
 - Return a JSON-serializable dict from `@rollout_entrypoint` (any structure accepted — no required keys)
 - Create model and agent inside the entrypoint function (not at module level) so config comes from the `_rollout` payload
 - Use standard `OpenAIModel` for OpenAI-compatible inference endpoints (token capture during training is handled at the infrastructure layer)
 - Implement reward functions as classes inheriting `RewardFunction`
+
+### Documentation
+
+- State concrete behavior directly. Do not add assurances about unrelated
+  side effects or explain nonexistent features. Include negative guarantees
+  only when readers need them to use the API correctly.
+- Avoid repeating explanations across design docs, READMEs, and docstrings.
+  Keep detailed contracts in one primary location and link to them elsewhere.
+- Design docs explain decisions and relevant tradeoffs, not conversation
+  history or implementation progress. Include rejected alternatives only
+  when they help explain a design decision.
+- Scope implementation choices to the implementation they describe.
+  Do not present defaults or example wiring as interface requirements.
 
 ### Symlink Note
 
@@ -602,6 +676,3 @@ uv pip install -e ../../ --force-reinstall --no-deps
 - **bedrock-agentcore-starter-toolkit** (CLI tools, Dockerfile generation): https://github.com/aws/bedrock-agentcore-starter-toolkit
 - **Runtime SDK Overview**: https://aws.github.io/bedrock-agentcore-starter-toolkit/user-guide/runtime/overview.html
 - **HTTP Protocol Contract**: https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-http-protocol-contract.html#container-requirements-http
-- **rLLM SDK (reference)**: https://rllm-project.readthedocs.io/en/latest/core-concepts/sdk/#1-define-your-agent-function
-- **rllm-model-gateway** (token capture proxy for RL training): https://github.com/rllm-org/rllm/tree/main/rllm-model-gateway | [PyPI](https://pypi.org/project/rllm-model-gateway/)
-- **AgentCore math training example** (rllm + Tinker backend): https://github.com/rllm-org/rllm/blob/main/examples/agentcore_math/train_agentcore_math_tinker.sh

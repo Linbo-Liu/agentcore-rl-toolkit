@@ -3,7 +3,6 @@
 import asyncio
 import json
 import logging
-import subprocess
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
@@ -28,13 +27,10 @@ from strands.types.exceptions import (
 from strands.types.streaming import StreamEvent
 from strands.vended_tools.bash import make_bash
 from strands.vended_tools.file_editor import make_file_editor
-from swe_agent_server.evaluation import run_evaluation
+from swe_agent_server.evaluation import capture_git_diff, run_evaluation
 from swe_agent_server.utils import clean_metrics, exc_to_full_string
 
-from agentcore_rl_toolkit.rollout_session.wire import (
-    RolloutDumpResponse,
-    RolloutStartRequest,
-)
+from agentcore_rl_toolkit.rollout_session.wire import RolloutDumpResponse
 
 logger = logging.getLogger(__name__)
 
@@ -174,11 +170,8 @@ class _RepoLocalEnvironment(NotASandboxLocalEnvironment):
             yield chunk
 
 
-def rollout(request: RolloutStartRequest) -> RolloutDumpResponse:
-    """Run a SWE rollout with the Strands agent and return a full RL trajectory dump.
-
-    Never raises: failures come back in ``exception``.
-    """
+def rollout(task_input: dict) -> RolloutDumpResponse:
+    """Run a SWE rollout with the Strands agent; never raises (failures come back in ``exception``)."""
     agent = None
     exception = None
     git_diff = None
@@ -189,8 +182,8 @@ def rollout(request: RolloutStartRequest) -> RolloutDumpResponse:
     context_window_exceeded = False
 
     try:
-        repo_path = request.task_input["repo_path"]
-        model = _build_model(request.task_input["llm"])
+        repo_path = task_input["repo_path"]
+        model = _build_model(task_input["llm"])
         sandbox = _RepoLocalEnvironment(working_dir=repo_path)
         timing = _ToolTimingHooks()
 
@@ -203,7 +196,7 @@ def rollout(request: RolloutStartRequest) -> RolloutDumpResponse:
             callback_handler=PrintingCallbackHandler(verbose_tool_use=False),
         )
 
-        instruction = get_instruction(request.task_input)
+        instruction = get_instruction(task_input)
 
         try:
             asyncio.run(agent.invoke_async(instruction))
@@ -217,18 +210,9 @@ def rollout(request: RolloutStartRequest) -> RolloutDumpResponse:
         tool_calls_time_s = timing.total_time_s
         llm_latency_sum = model.llm_latency_sum
 
-        git_diff = subprocess.check_output(
-            [
-                "git",
-                "--no-pager",
-                "diff",
-                "--no-color",
-                request.task_input["base_commit"],
-            ],
-            cwd=repo_path,
-        ).decode()
+        git_diff = capture_git_diff(task_input)
 
-        eval_report = run_evaluation(request.task_input)
+        eval_report = run_evaluation(task_input)
 
     except Exception as error:
         logging.error("Exception during rollout", exc_info=error)
