@@ -19,11 +19,12 @@ from sagemaker.train.training_session import AdamParams, ServiceClient
 from agentcore_rl_toolkit.backends.experimental.sagemaker.config import Config, load_config
 from agentcore_rl_toolkit.backends.experimental.sagemaker.datum import trace_record_to_datum
 from agentcore_rl_toolkit.backends.experimental.sagemaker.rollout import load_dataset, local_ip, run_one_rollout
-from agentcore_rl_toolkit.client import RolloutClient
+from agentcore_rl_toolkit.concurrency.rate_limiter import LocalRateLimiter
 from agentcore_rl_toolkit.rollout_gateway import HfTemplateRenderer, TraceRecord
 from agentcore_rl_toolkit.rollout_gateway.gateway import RolloutGateway
 from agentcore_rl_toolkit.rollout_gateway.sampling_backends.sagemaker_sdk import SageMakerSdkBackend
 from agentcore_rl_toolkit.rollout_gateway.server import ThreadedGatewayServer
+from agentcore_rl_toolkit.runtime import AgentCoreHttpClient
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s: %(message)s")
@@ -89,6 +90,7 @@ async def train(config: Config) -> None:
     asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
 
     gateway: ThreadedGatewayServer | None = None
+    rollout_client: AgentCoreHttpClient | None = None
     wandb_run: Any = None
     try:
         wandb_run = _init_wandb(config, tc.training_session_name)
@@ -97,21 +99,19 @@ async def train(config: Config) -> None:
         backend = SageMakerSdkBackend(tc.create_sampling_client())
         _gw = RolloutGateway(
             backend=backend,
-            renderer=HfTemplateRenderer(tokenizer),
+            renderer=HfTemplateRenderer(tokenizer, chat_template_kwargs=config.chat_template_kwargs),
             tokenizer=tokenizer,
             adapters=["openai", "anthropic"],
+            history_mode=config.history_mode,
         )
         gateway = ThreadedGatewayServer(_gw, host=local_ip(), port=config.gateway_port)
         gateway.start()
         logger.info("Gateway base_url: %s", gateway.base_url)
 
-        exp_id = config.exp_id or f"sagemaker-train-{int(time.time())}"
-        rollout_client = RolloutClient(
-            agent_runtime_arn=config.agent_runtime_arn,
-            s3_bucket=config.s3_bucket,
-            exp_id=exp_id,
-            tps_limit=config.acr_tps_limit,
+        rollout_client = AgentCoreHttpClient(
+            config.agent_runtime_arn,
             max_pool_connections=config.batch_size * config.responses_per_prompt + 10,
+            request_rate_limiter=LocalRateLimiter(config.acr_tps_limit),
         )
 
         dataset = load_dataset(config.dataset_path)
@@ -191,7 +191,7 @@ async def train(config: Config) -> None:
                 metrics: dict[str, Any] = {"step": global_step, "epoch": epoch}
 
                 if config.save_every > 0 and global_step > 0 and global_step % config.save_every == 0:
-                    ckpt = await asyncio.to_thread(lambda: tc.save_state().result(timeout=600))
+                    ckpt = await asyncio.to_thread(lambda: tc.save_state().result(timeout=config.train_op_timeout))
                     logger.info("Checkpoint saved: %s", ckpt.model_package_arn)
 
                 st = time.monotonic()
@@ -221,8 +221,8 @@ async def train(config: Config) -> None:
                 st = time.monotonic()
                 fwd_bwd_op = tc.forward_backward(training_datums, loss_fn=config.loss)
                 optim_op = tc.optim_step(AdamParams(learning_rate=config.learning_rate))
-                fwd_bwd_result = await asyncio.to_thread(fwd_bwd_op.result, timeout=600)
-                await asyncio.to_thread(optim_op.result, timeout=600)
+                fwd_bwd_result = await asyncio.to_thread(fwd_bwd_op.result, timeout=config.train_op_timeout)
+                await asyncio.to_thread(optim_op.result, timeout=config.train_op_timeout)
 
                 metrics["time/train"] = time.monotonic() - st
                 metrics["timestamp"] = datetime.now().isoformat()
@@ -247,18 +247,20 @@ async def train(config: Config) -> None:
             await run_eval(global_step)
 
         logger.info("Training complete. Saving final checkpoint…")
-        final_ckpt = await asyncio.to_thread(lambda: tc.save_state().result(timeout=600))
+        final_ckpt = await asyncio.to_thread(lambda: tc.save_state().result(timeout=config.train_op_timeout))
         logger.info("Final checkpoint: %s", final_ckpt.model_package_arn)
 
         if config.save_weights_at_end:
             w = await asyncio.to_thread(
-                lambda: tc.save_weights_for_sampler(description="final weights").result(timeout=600)
+                lambda: tc.save_weights_for_sampler(description="final weights").result(timeout=config.train_op_timeout)
             )
             logger.info("Inference model package: %s", w.model_package_arn)
     finally:
         tc.stop()  # first: nothing may preempt stopping the billing session
         if gateway is not None:
             gateway.shutdown()
+        if rollout_client is not None:
+            await rollout_client.aclose()
         if wandb_run:
             wandb_run.finish()
 

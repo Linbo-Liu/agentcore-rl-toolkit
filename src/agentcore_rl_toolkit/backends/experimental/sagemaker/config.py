@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import yaml
@@ -17,12 +17,16 @@ class Config:
     resume_from_model_package: str = ""
 
     # --- ACR / rollout ---
+    # An AgentCoreRuntimeApp agent: reads model config from ``_config`` and returns ``{"reward": float}``.
     agent_runtime_arn: str = ""
-    s3_bucket: str = ""
-    exp_id: str = ""
     max_rollout_time: float = 1800.0
     acr_tps_limit: int = 5
     gateway_port: int = 0
+    # "tree": re-tokenization drift forks a rollout into multiple records.
+    # "linear": reuse served token ids for append-only histories; one record per rollout.
+    history_mode: Literal["tree", "linear"] = "tree"
+    # Passed to the gateway renderer's apply_chat_template, e.g. {"enable_thinking": false}.
+    chat_template_kwargs: dict = field(default_factory=dict)
 
     # --- RL training ---
     batch_size: int = 32
@@ -35,6 +39,8 @@ class Config:
     save_every: int = -1
     loss: Literal["ppo", "importance_sampling", "cispo"] = "ppo"
     save_weights_at_end: bool = False
+    # Seconds to wait on each forward_backward / optim_step / save call.
+    train_op_timeout: float = 600.0
 
     # --- Dataset ---
     dataset_path: str = ""

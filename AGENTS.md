@@ -275,10 +275,13 @@ Key pieces:
   (`ppo` | `importance_sampling` | `cispo`). The training session bills until stopped, so
   `tc.stop()` is the first statement in the `finally` and a `SIGTERM` handler cancels the
   task rather than letting the signal kill the interpreter before teardown.
-- `rollout.py` — `run_one_rollout()`: one UUID per rollout serves as gateway session id,
-  ACR `runtimeSessionId`, **and** `api_key`, so the same capture-key contract the verl
-  backend uses applies unchanged. Returns reward 0.0 (logged, never raised) on timeout,
-  ACR error, non-200 agent status, or a missing/non-numeric reward.
+- `rollout.py` — `run_one_rollout()`: drives an `AgentCoreRuntimeApp` agent through
+  `AgentCoreHttpClient` / `AgentCoreHttpSession` (`AgentCoreRLApp` agents are not
+  supported). One UUID per rollout serves as gateway session id, ACR
+  `runtimeSessionId`, **and** `api_key` (sent in the payload's `_config` with
+  `base_url` / `model_id`). The agent returns a scalar `{"reward": ...}`; reward is
+  0.0 (logged, never raised) on timeout, ACR error, agent exception, or a
+  missing/non-numeric reward.
 - `datum.py` — `trace_record_to_datum()`: `TraceRecord` + advantage → a SageMaker datum
   (shifted `input`/`target_tokens`, with `weights` / `logprobs` / `advantages` left-padded
   over the prompt span). Returns `None` for an empty or all-zero loss mask; a step with no
@@ -292,8 +295,8 @@ Key pieces:
 - `config.py` / `config.yaml.example` — typed dataclass + template; `load_config` silently
   drops unknown YAML keys. Local `config.yaml` is gitignored (holds ARNs).
 - `prepare_datasets/prepare_gsm8k.py` — GSM8K → Parquet. Same payload-first dataset
-  contract as the verl backend (one `payload` column forwarded verbatim to
-  `@rollout_entrypoint`), but read directly by `rollout.load_dataset()` (Parquet or JSONL)
+  contract as the verl backend (one `payload` column forwarded verbatim to the
+  agent's entrypoint), but read directly by `rollout.load_dataset()` (Parquet or JSONL)
   with no synthesized `prompt` column, since there is no verl dataloader to satisfy.
 
 Current limits: GRPO only (`SageMakerSdkBackend`, `run_one_rollout()`,

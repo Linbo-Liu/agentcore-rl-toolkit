@@ -210,6 +210,43 @@ agentcore invoke --agent strands_math_agent_rl '{
 
 You should be able to see the rollout and reward saved to `s3://agentcore-rl/test/prompt_213_session_213.json`.
 
+## Run Runtime App (No S3)
+
+`runtime_app.py` is the same agent on [`AgentCoreRuntimeApp`](../../designs/agentcore_runtime_app.md). It keeps
+`@app.entrypoint`, reads model config from `_config`, and returns `{"reward": float}`. Results are fetched over
+HTTP instead of S3, so no bucket or S3 IAM policy is needed. This is the agent shape the
+[Tinker API](../../src/agentcore_rl_toolkit/backends/tinker_api/README.md) and
+[SageMaker](../../src/agentcore_rl_toolkit/backends/experimental/sagemaker/SETUP.md) backends drive.
+
+`AgentCoreRuntimeApp` requires `agentcore-rl-toolkit>=0.1.5`.
+
+```bash
+python runtime_app.py
+
+PAYLOAD='"prompt": "Toula went to the bakery and bought various types of pastries. She bought 3 dozen donuts which cost $68 per dozen, 2 dozen mini cupcakes which cost $80 per dozen, and 6 dozen mini cheesecakes for $55 per dozen. How much was the total cost?", "answer": "694", "_config": {"base_url": "http://localhost:4000/v1", "model_id": "Qwen/Qwen3-4B-Instruct-2507"}'
+
+# Ordinary request: returns {"reward": ...}
+curl -X POST http://localhost:8080/invocations -H "Content-Type: application/json" -d "{$PAYLOAD}"
+
+# Background start, then get by invocation ID
+curl -X POST http://localhost:8080/invocations -H "Content-Type: application/json" \
+     -d "{$PAYLOAD, \"_agentcore_runtime\": {\"version\": 1, \"operation\": \"start\", \"invocation_id\": \"inv1\", \"background\": true}}"
+curl -X POST http://localhost:8080/invocations -H "Content-Type: application/json" \
+     -d '{"_agentcore_runtime": {"version": 1, "operation": "get", "invocation_id": "inv1"}}'
+```
+
+Deploy with `agentcore configure --entrypoint runtime_app.py --name strands_math_agent_runtime ...` (same options as
+the RL app above), then drive it with `AgentCoreHttpClient` (requires `agentcore-rl-toolkit[rollout]`):
+
+```python
+from agentcore_rl_toolkit import AgentCoreHttpClient
+
+async with AgentCoreHttpClient(runtime_arn) as client:
+    handle = await client.invoke(payload, session_id=session_id, background=True)
+    result = await handle.result(timeout=600)  # {"reward": 1.0}
+    await client.stop_session(session_id)
+```
+
 ## Appendix
 
 The following covers instructions for a set of common dev workflows.

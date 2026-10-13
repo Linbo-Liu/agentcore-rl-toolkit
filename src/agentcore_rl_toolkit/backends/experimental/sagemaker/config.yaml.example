@@ -4,12 +4,10 @@
 role_arn: "arn:aws:iam::<account-id>:role/<your-sagemaker-role>"
 s3_output_path: "s3://<your-s3-bucket>/output/" # S3 to store model checkpoints
 model_package_group_arn: "arn:aws:sagemaker:<region>:<account-id>:model-package-group/<your-group>"
-s3_bucket: "<your-rollout-s3-bucket>" # S3 to store AgentCore rollout data
 base_model_arn: "arn:aws:sagemaker:<region>:aws:hub-content/SageMakerPublicHub/Model/<model-name>"
-agent_runtime_arn: "arn:aws:bedrock-agentcore:<region>:<account-id>:runtime/<your-agent-id>"
+agent_runtime_arn: "arn:aws:bedrock-agentcore:<region>:<account-id>:runtime/<your-agent-id>" # an AgentCoreRuntimeApp agent, e.g. examples/strands_math_agent/runtime_app.py
 
 region: "us-east-1"
-exp_id: "my-experiment"
 
 # --- LoRA ---
 lora_rank: 32
@@ -38,10 +36,13 @@ eval_temperature: 0.0
 
 # --- Gateway ---
 gateway_port: 0    # 0 = OS-assigned
+history_mode: linear # tree | linear (linear: one record per append-only rollout)
+chat_template_kwargs: {enable_thinking: false}  # e.g. {enable_thinking: false}
 
 # --- Checkpointing ---
 save_every: -1     # -1 = only at end
 save_weights_at_end: false
+train_op_timeout: 600.0  # seconds per forward_backward / optim_step / save
 
 # --- Rollout ---
 max_rollout_time: 1800.0

@@ -22,7 +22,7 @@ and is driven by a single YAML config:
 |---|---|
 | `train_grpo.py` | The GRPO training loop: rollout → advantages → `forward_backward` → `optim_step` → rebind sampler. |
 | `config.py` / `config.yaml.example` | Typed config dataclass and a template to copy. |
-| `rollout.py` | One ACR rollout: create gateway session, invoke the agent, await the S3 result, drain trajectories. |
+| `rollout.py` | One ACR rollout: create gateway session, invoke the agent over HTTP with `AgentCoreHttpClient`, await its result, drain trajectories. |
 | `datum.py` | Converts a gateway `TraceRecord` (+ advantage) into a SageMaker training datum. |
 | `prepare_datasets/` | Dataset preprocessing scripts (GSM8K). |
 
@@ -37,15 +37,15 @@ a `token_ids -> token_ids + logprobs` sampling backend over the SageMaker
 ## Prerequisites
 
 - Python 3.12 and [`uv`](https://docs.astral.sh/uv/). No local GPU required.
-- AWS credentials with permission to invoke an AgentCore Runtime, read/write an
-  S3 bucket, and create SageMaker training sessions.
-- An AgentCore Runtime deployment of your agent — follow the
-  [Prepare agent for RL](/agentcore-rl-toolkit/guides/agent-adaptation/) guide.
-  Save the resulting **runtime ARN** (`agent_runtime_arn` below). Your
-  `rl_app.py` must read `api_key` from the `_rollout` payload
-  (`payload["_rollout"].get("api_key") or "EMPTY"`) — the gateway keys token
-  capture off the api-key / Bearer slot.
-- An S3 bucket for rollout result delivery (`s3_bucket` below).
+- AWS credentials with permission to invoke an AgentCore Runtime and create
+  SageMaker training sessions.
+- An AgentCore Runtime deployment of an `AgentCoreRuntimeApp` agent, such as
+  [`examples/strands_math_agent/runtime_app.py`](https://github.com/awslabs/agentcore-rl-toolkit/blob/main/examples/strands_math_agent/runtime_app.py).
+  `AgentCoreRLApp` (`@rollout_entrypoint`) agents are not supported by this
+  backend. Save the resulting **runtime ARN** (`agent_runtime_arn` below). The
+  agent reads `base_url`, `model_id`, and `api_key` from the payload's
+  `_config` field (`config.get("api_key") or "EMPTY"`) — the gateway keys token
+  capture off the api-key / Bearer slot — and returns `{"reward": <float>}`.
 - SageMaker resources: an execution **role ARN**, an S3 **output path** for
   checkpoints, a **model package group ARN** for saved states, and the **hub
   content ARN** of the base model you want to fine-tune.
@@ -57,8 +57,8 @@ a `token_ids -> token_ids + logprobs` sampling backend over the SageMaker
 The training loop hosts the rollout gateway itself. `train_grpo.py` starts a
 [`ThreadedGatewayServer`](https://github.com/awslabs/agentcore-rl-toolkit/blob/main/src/agentcore_rl_toolkit/rollout_gateway/server.py)
 bound to the host's primary private IP, then passes the resulting
-`http://<private-ip>:<port>/v1` to the agent as `base_url` in the `_rollout`
-payload. Every model call the agent makes is therefore an **inbound connection
+`http://<private-ip>:<port>/v1` to the agent as `base_url` in the `_config`
+payload field. Every model call the agent makes is therefore an **inbound connection
 from the ACR runtime to your host** — the reverse of the direction people usually
 expect. Rollout results come back out-of-band through S3, but sampling does not.
 
@@ -104,8 +104,8 @@ uv pip install wandb                    # optional, for training curves
 ## Prepare data
 
 The dataset is a Parquet or JSONL file with a single **`payload`** column /
-field. Each row's `payload` is forwarded **verbatim** as the dict your
-`@rollout_entrypoint` function receives — no trainer-side tokenization, no
+field. Each row's `payload` is forwarded **verbatim** (plus the `_config`
+field) as the dict your `@app.entrypoint` function receives — no trainer-side tokenization, no
 prompt column. Put every per-rollout field your agent needs (prompt,
 ground-truth answer, task IDs, resource URIs) inside `payload`.
 
@@ -130,14 +130,12 @@ Required — training fails fast without these:
 | `s3_output_path` | S3 prefix for model checkpoints. |
 | `model_package_group_arn` | Model package group that saved states / weights land in. |
 | `agent_runtime_arn` | Your deployed AgentCore Runtime agent. |
-| `s3_bucket` | Bucket the agent writes rollout results (rewards) to. |
 | `dataset_path` | Training Parquet/JSONL file. |
 
 The rest, grouped as in `config.yaml.example`:
 
 ```yaml
 region: "us-east-1"
-exp_id: "my-experiment"      # S3 key prefix for rollout results
 
 # --- LoRA ---
 lora_rank: 32
@@ -166,10 +164,13 @@ eval_temperature: 0.0
 # --- Gateway ---
 gateway_port: 0              # 0 = OS-assigned; pin it to open a narrow inbound
                              # security-group rule (see Networking)
+history_mode: tree           # tree | linear; linear keeps an append-only rollout in one record
+chat_template_kwargs: {}     # passed to apply_chat_template, e.g. {enable_thinking: false}
 
 # --- Checkpointing ---
 save_every: -1               # -1 = only at the end
 save_weights_at_end: false   # also publish an inference-ready model package
+train_op_timeout: 600.0      # seconds to wait on each forward_backward / optim_step / save
 
 # --- Rollout ---
 max_rollout_time: 1800.0     # per-rollout deadline, seconds
@@ -195,13 +196,13 @@ Per global step, `train_grpo.py`:
 1. **Rollout** — pops `batch_size` payloads; for each, runs `responses_per_prompt`
    ACR rollouts concurrently. Each rollout gets a fresh UUID used as the ACR
    `runtimeSessionId`, the gateway capture session id, and the `api_key` — so one
-   id ties the container, the trajectory, and the S3 result together.
+   id ties the container, the trajectory, and the result together.
 2. **Capture** — the agent's OpenAI/Anthropic calls go to the gateway
    (`base_url`), which renders messages to tokens, samples through the SageMaker
    `SamplingClient`, and records token ids, logprobs, and a loss mask per turn.
-3. **Reward** — the agent writes `{"rewards": ...}` to S3; the loop awaits it
-   (`max_rollout_time`) and stamps it onto the trajectory. A timeout, an ACR
-   error, a non-200 agent status, or a missing/non-numeric reward all score
+3. **Reward** — the agent returns `{"reward": ...}`, which the loop fetches over
+   HTTP (`max_rollout_time`) and stamps onto the trajectory. A timeout, an ACR
+   error, an agent exception, or a missing/non-numeric reward all score
    **0.0** and are logged rather than raised — one bad rollout never kills a run.
 4. **Advantages** — rewards are centered and normalized within each GRPO group;
    every trajectory-tree leaf becomes one datum (multi-turn agents and
@@ -225,9 +226,8 @@ Metrics go to the console and, if `wandb_project` is set, to Weights & Biases:
 
 ## Notes and current limits
 
-- **Rewards are agent-side.** The agent returns `{"rewards": ...}` from its
-  `@rollout_entrypoint`; there is no trainer-side reward model. A list is read as
-  its last element.
+- **Rewards are agent-side.** The agent returns a scalar `{"reward": ...}` from
+  its `@app.entrypoint`; there is no trainer-side reward model.
 - **LoRA only.** Sessions are created via `create_lora_training_client`
   (`lora_rank` / `lora_alpha`); full fine-tuning is not exposed here.
 - **GRPO only.** `train_grpo.py` is the only algorithm implemented; `loss`
