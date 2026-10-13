@@ -5,10 +5,10 @@ description = "Example: Strands Math Agent using Bedrock AgentCore RL Toolkit"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "agentcore-rl-toolkit>=0.1.0",
+    "agentcore-rl-toolkit>=0.1.5",
     "strands-agents[openai]>=1.18.0",
     "strands-agents-tools>=0.2.16",
 ]
 
 [tool.setuptools]
-py-modules = ["basic_app", "rl_app", "models", "reward"]
+py-modules = ["basic_app", "rl_app", "runtime_app", "models", "reward"]
