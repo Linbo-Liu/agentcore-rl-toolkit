@@ -11,6 +11,17 @@ a new client each time, and reusing the old one silently samples stale weights).
 may already be in a ``generate()`` call — in-flight requests finish against the old
 weights, all subsequent calls use the new client.
 
+Each call awaits ``APIFuture.result_async()``, which holds a worker thread only for
+each status poll (one blocking ``Get*OperationResult`` per ``to_thread``), not for the
+whole operation; blocking ``result()`` in ``to_thread`` held one of the stock
+``min(32, cpu + 4)`` threads per in-flight sample, queueing samples behind each other at
+hundreds of concurrent rollouts. The polls run on the event loop's default executor,
+which the backend sizes to ``poll_threads`` the first time it samples on a loop.
+
+The service rejects ``maxTokens`` below 512. ``min_new_tokens`` declares that floor so
+the gateway adapter treats a context budget with less room than that as exhausted
+(``context_length_exceeded``) instead of sending a request the service refuses.
+
 ``sagemaker`` is imported lazily so the core gateway stays lean. Install the SDK wheel
 (``pip install sagemaker_train-*.whl``) before using this backend.
 """
@@ -18,6 +29,7 @@ weights, all subsequent calls use the new client.
 import asyncio
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from sagemaker.train.training_session import SamplingParams as SagemakerSamplingParams
@@ -37,11 +49,23 @@ class SageMakerSdkBackend:
             ``TrainingClient.save_weights_and_get_sampling_client()``.
             Weights are fixed at client creation — call ``set_sampling_client()``
             after every ``save_weights_and_get_sampling_client()`` to stay on-policy.
+        poll_threads: Size of the default executor installed on the loop running
+            ``generate()`` (it runs the SDK's status polls). ``None`` keeps the
+            loop's executor as is.
     """
 
-    def __init__(self, sampling_client: Any) -> None:
+    # SamplingParams.maxTokens floor in the Training Sessions API (min=512 in the service model).
+    min_new_tokens = 512
+
+    def __init__(
+        self,
+        sampling_client: Any,
+        poll_threads: int | None = 256,
+    ) -> None:
         self._sampling_client = sampling_client
         self._lock = threading.Lock()
+        self._poll_threads = poll_threads
+        self._executor_loop: asyncio.AbstractEventLoop | None = None
 
     def set_sampling_client(self, sampling_client: Any) -> None:
         """Rebind to a new ``SamplingClient`` (e.g. after a weight update).
@@ -72,13 +96,17 @@ class SageMakerSdkBackend:
             top_k=sampling_params.get("top_k"),
             stop=sampling_params.get("stop") or [],
         )
-        # Run the blocking SDK poll in a thread-pool executor so the gateway's
-        # event loop stays responsive during the wait. The SDK's APIFuture.result()
-        # polls until the operation completes; asyncio.to_thread yields the loop
-        # for the duration, matching the pattern used in the gsm8k demo.
         timeout = float(sampling_params.get("timeout", 900.0))
+
+        loop = asyncio.get_running_loop()
+        if self._poll_threads is not None and self._executor_loop is not loop:
+            loop.set_default_executor(
+                ThreadPoolExecutor(max_workers=self._poll_threads, thread_name_prefix="sagemaker-poll")
+            )
+            self._executor_loop = loop
+
         op = sc.sample(prompt=list(prompt_ids), num_samples=1, sampling_params=sp)
-        result = await asyncio.to_thread(op.result, timeout=timeout)
+        result = await op.result_async(timeout=timeout)
 
         seq = result.sequences[0]
         output_ids = list(seq.tokens)

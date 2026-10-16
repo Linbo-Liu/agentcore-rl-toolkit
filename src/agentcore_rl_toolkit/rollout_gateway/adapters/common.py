@@ -395,20 +395,23 @@ class BaseAdapter:
             if sid in self.closed:
                 return web.Response(status=503, text="session closed")
             sampling_params = _sampling_params(s, body, max_token_keys=self.max_token_keys, stop_keys=self.stop_keys)
-            # Context-budget clamp (backend-neutral): an input that fills the
-            # per-sid budget cannot generate even one token. Report that as an
-            # input-context error, rather than fabricating a zero-token,
-            # length-capped completion that clients cannot distinguish from a
-            # normal empty model response.
+            # Context-budget clamp (backend-neutral): an input that leaves less room
+            # than the backend can sample (1 token, or a backend-declared
+            # ``min_new_tokens`` floor) is an input-context error, rather than a
+            # fabricated zero-token, length-capped completion that clients cannot
+            # distinguish from a normal empty model response.
             if s.max_context_tokens > 0:
                 remaining = s.max_context_tokens - len(prompt_ids)
-                if remaining <= 0:
+                min_new_tokens = getattr(self.backend, "min_new_tokens", 1)
+                if remaining < min_new_tokens:
                     self.logger.warning(
-                        "[%s] sid=%s prompt fills max_context_tokens (%d >= %d)",
+                        "[%s] sid=%s prompt leaves %d < %d tokens of max_context_tokens=%d (prompt=%d)",
                         self.log_prefix,
                         sid,
-                        len(prompt_ids),
+                        remaining,
+                        min_new_tokens,
                         s.max_context_tokens,
+                        len(prompt_ids),
                     )
                     return self._context_limit_error(
                         prompt_tokens=len(prompt_ids),
