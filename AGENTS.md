@@ -255,14 +255,19 @@ the `sagemaker-train` wheel (see above); user-facing setup lives in
 Key pieces:
 - `rollout_gateway/sampling_backends/sagemaker_sdk.py` — `SageMakerSdkBackend`: gateway
   `SamplingBackend` over the SageMaker `SamplingClient`. Renderer-free like
-  `TinkerSdkBackend` (the SDK cannot render; the gateway owns tokenization). Two SDK
+  `TinkerSdkBackend` (the SDK cannot render; the gateway owns tokenization). Three SDK
   properties shape it: **(a)** weights are pinned at sampling-client creation, so
   `save_weights_and_get_sampling_client()` returns a *new* client each update and reusing
   the old one silently samples stale weights — `set_sampling_client()` rebinds under a
   `threading.Lock` while the gateway's background thread may be mid-`generate()`
   (in-flight calls finish against the old weights, subsequent calls use the new client);
-  **(b)** `APIFuture.result()` blocks by polling, so `generate()` wraps it in
-  `asyncio.to_thread` to keep the gateway loop responsive under concurrent rollouts.
+  **(b)** `generate()` awaits `APIFuture.result_async()`, which holds a thread only per
+  status poll (blocking `result()` in `to_thread` held one of the stock `min(32, cpu+4)`
+  threads per in-flight sample); the polls run on the loop's default executor, sized to
+  `poll_threads` (default 256);
+  **(c)** the service rejects `maxTokens < 512`, so the backend declares
+  `min_new_tokens = 512` and the gateway adapter returns `context_length_exceeded` when
+  less room than that is left (other backends default to 1, i.e. no room).
   Both are covered in `tests/rollout_gateway/test_sagemaker_sdk_backend.py`, which stubs
   the `sagemaker` module so the tests need no SDK wheel and no AWS calls.
 - `train_grpo.py` — the loop, run as

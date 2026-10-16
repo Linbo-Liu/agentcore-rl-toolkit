@@ -484,6 +484,31 @@ async def test_anthropic_max_context_tokens_returns_context_window_error():
         assert await gateway.finish_session(sid) == []
 
 
+@pytest.mark.asyncio
+async def test_backend_min_new_tokens_treats_small_room_as_context_window_error():
+    """A backend floor (SageMaker: maxTokens >= 512) makes room below it count as exhausted."""
+    gateway, backend = make_gateway(replies=["hello"])
+    backend.min_new_tokens = 4
+    sid = "ep7:floor"
+
+    async with serve(gateway) as client:
+        # prompt renders to 3 ids: a budget of 6 leaves 3 < 4 tokens of room
+        gateway.create_session(sid, max_context_tokens=6)
+        body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+        resp = await client.post("/v1/chat/completions", json=body, headers=bearer(sid))
+        assert resp.status == 400
+        assert (await resp.json())["error"]["code"] == "context_length_exceeded"
+        assert backend.calls == []
+
+        # a budget of 7 leaves exactly the floor: sampled, clamped to the room left
+        sid2 = "ep7:floor-ok"
+        gateway.create_session(sid2, max_context_tokens=7)
+        resp = await client.post("/v1/chat/completions", json=body, headers=bearer(sid2))
+        assert resp.status == 200
+        (call,) = backend.calls
+        assert call["sampling_params"]["max_new_tokens"] == 4
+
+
 # ---------------------------------------------------------------------------
 # streaming + shared endpoints + adapter selection
 # ---------------------------------------------------------------------------

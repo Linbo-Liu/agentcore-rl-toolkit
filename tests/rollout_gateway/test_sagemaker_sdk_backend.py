@@ -13,6 +13,7 @@ import enum
 import sys
 import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -94,6 +95,10 @@ class FakeOperation:
         if self._gate is not None and not self._gate.wait(5):
             raise AssertionError("gate never released — result() likely blocked the event loop")
         return self._result
+
+    async def result_async(self, timeout=None):
+        # Like the SDK: each blocking poll runs on the loop's default executor.
+        return await asyncio.to_thread(self.result, timeout)
 
 
 class FakeSamplingClient:
@@ -326,7 +331,7 @@ async def test_in_flight_generate_finishes_against_the_old_client():
 
 @pytest.mark.asyncio
 async def test_blocking_poll_does_not_stall_the_event_loop():
-    """``result()`` blocks; it must run in a thread or the gateway serves one rollout at a time."""
+    """The SDK wait must not block the loop, or the gateway serves one rollout at a time."""
     gate = threading.Event()
     backend = SageMakerSdkBackend(FakeSamplingClient(make_sequence([9]), gate=gate))
 
@@ -351,3 +356,33 @@ async def test_concurrent_generates_overlap():
 
     records = await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
     assert [r.output_ids for r in records] == [[9], [9]]
+
+
+def test_declares_service_max_tokens_floor():
+    """The adapter reads this to treat < 512 tokens of context room as exhausted."""
+    assert SageMakerSdkBackend.min_new_tokens == 512
+
+
+@pytest.mark.asyncio
+async def test_poll_executor_is_sized_once_per_loop():
+    """SDK polls run on the loop's default executor; the stock min(32, cpu+4) caps throughput."""
+    backend = SageMakerSdkBackend(FakeSamplingClient(), poll_threads=300)
+
+    await backend.generate(prompt_ids=[1], sampling_params={})
+    executor = asyncio.get_running_loop()._default_executor
+    await backend.generate(prompt_ids=[1], sampling_params={})
+
+    assert executor._max_workers == 300
+    assert asyncio.get_running_loop()._default_executor is executor
+
+
+@pytest.mark.asyncio
+async def test_poll_threads_none_keeps_loop_executor():
+    loop = asyncio.get_running_loop()
+    mine = ThreadPoolExecutor(max_workers=2)
+    loop.set_default_executor(mine)
+    backend = SageMakerSdkBackend(FakeSamplingClient(), poll_threads=None)
+
+    await backend.generate(prompt_ids=[1], sampling_params={})
+
+    assert loop._default_executor is mine
