@@ -105,17 +105,6 @@ export default defineConfig({
 						},
 					],
 				},
-				{
-					label: 'Troubleshooting',
-					items: [
-						{
-							label: 'Training Backends',
-							items: [
-								{ label: 'slime', slug: 'troubleshooting/slime' },
-							],
-						},
-					],
-				},
 			],
 		}),
 	],

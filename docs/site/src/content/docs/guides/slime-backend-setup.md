@@ -20,10 +20,6 @@ slime's SGLang router. The agent's OpenAI-compatible client points at that
 gateway, which records token IDs, logprobs, and loss masks for every model
 turn; rewards come from the dict the agent returns.
 
-For known issues (e.g. the norm-epsilon mismatch on
-Qwen2.5-32B-Instruct) see
-[slime troubleshooting](/agentcore-rl-toolkit/troubleshooting/slime/).
-
 ## Prerequisites
 
 - A GPU cluster with **CUDA 13** installed (the scripts default to
