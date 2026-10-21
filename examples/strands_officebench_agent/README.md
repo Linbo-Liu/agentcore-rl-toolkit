@@ -99,7 +99,7 @@ Copy the config template and fill in the `agent_arn` (and any eval settings the 
 cp config.example.toml config.toml
 # Edit config.toml:
 #   agentcore.agent_arn = "<the arn agentcore deploy printed>"
-#   eval.s3_input_bucket / s3_output_bucket / model_id / base_url
+#   eval.s3_input_bucket / model_id / base_url
 ```
 
 ### 5. Run benchmark
@@ -118,10 +118,12 @@ python benchmark.py --exp_id my_run_1app --category 1
 python benchmark.py --exp_id my_run --resume
 ```
 
-Results are saved to:
+Set `--output_dir ./results` to save:
+
 - `results/{exp_id}/rollouts.jsonl` — per-task results with full conversation history
 - `results/{exp_id}/summary.json` — scores by category
-- `s3://{s3_output_bucket}/{exp_id}/...` — rollout data on S3
+
+The default output directory is under the operating system's temporary directory.
 
 > **Security note — where `task_uri`/`testbed_uri` come from, and why they are a trust
 > boundary.** `benchmark.py` lists the S3 prefix you populated in step 1
@@ -152,7 +154,6 @@ agent_arn = "arn:aws:bedrock-agentcore:us-west-2:123456789012:runtime/agent-id"
 
 [eval]
 s3_input_bucket = "s3://your-bucket/officebench/"
-s3_output_bucket = "your-output-bucket"
 model_id = "us.anthropic.claude-sonnet-5-5"
 # base_url = "http://your-vllm-server:8000/v1"  # uncomment for vLLM
 ```
@@ -222,13 +223,13 @@ OFFICEBENCH_DIR=/path/to/OfficeBench python run_local_eval.py --exp_id local_tes
 
 ```
 strands_officebench_agent/
-├── rl_app.py           # AgentCoreRLApp with @rollout_entrypoint (runs in ACR)
+├── rl_app.py           # Office agent and reward computation
 ├── tools.py            # 20 Strands @tool wrappers for OfficeBench apps
 ├── reward.py           # OfficeBenchReward with 9 evaluation functions
 ├── models.py           # Pydantic request models
 ├── utils.py            # S3 helpers (load task, setup testbed)
 ├── benchmark.py        # Full benchmark runner (ACR)
-├── evaluate.py         # Batch evaluation via RolloutClient (ACR, lower-level)
+├── evaluate.py         # Batch evaluation
 ├── preprocess.py       # Package OfficeBench tasks for S3
 ├── Dockerfile          # Custom ACR container (LibreOffice, Tesseract, OfficeBench apps) — copy over the auto-generated one
 ├── test_local.py       # Single-task local testing (no ACR)
