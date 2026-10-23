@@ -47,16 +47,13 @@ hero:
         </div>
         <div class="hero-step-panel" data-panel="2">
           <pre class="hero-code"><code><span class="ln"><span style="color:#6a9955"># Install the AgentCore CLI</span></span>
-      <span class="ln">pip install bedrock-agentcore-starter-toolkit</span>
+      <span class="ln">uv tool install bedrock-agentcore-starter-toolkit</span>
       <span class="ln"></span>
-      <span class="ln"><span style="color:#6a9955"># Configure and deploy</span></span>
-      <span class="ln">agentcore configure \</span>
-      <span class="ln">    --entrypoint rl_app.py \</span>
-      <span class="ln">    --name my_rl_agent \</span>
-      <span class="ln">    --deployment-type container \</span>
-      <span class="ln">    --non-interactive</span>
+      <span class="ln">agentcore configure --entrypoint rl_app.py \</span>
+      <span class="ln">  --name agent --requirements-file pyproject.toml \</span>
+      <span class="ln">  --deployment-type container --disable-memory --non-interactive</span>
       <span class="ln"></span>
-      <span class="ln">agentcore deploy --agent my_rl_agent</span>
+      <span class="ln">agentcore deploy</span>
       <span class="ln"></span>
       <span class="ln"><span style="color:#6a9955"># → arn:aws:bedrock-agentcore:us-west-2:...</span></span></code></pre>
         </div>

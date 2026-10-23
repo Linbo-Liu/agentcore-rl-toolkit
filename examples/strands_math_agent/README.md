@@ -13,7 +13,8 @@ source .venv/bin/activate
 uv pip install -e .
 ```
 
-Install the deployment CLI on the machine used to deploy the agent:
+Install the Python [AgentCore CLI](https://github.com/aws/bedrock-agentcore-starter-toolkit)
+separately on the deployment machine:
 
 ```bash
 uv tool install bedrock-agentcore-starter-toolkit
@@ -50,49 +51,34 @@ curl -X POST http://localhost:8080/invocations \
 ## Run Basic App Hosted on ACR
 
 ### Deploy
-Once the app works locally, we can deploy it to ACR. It's straightforward with the AgentCore CLI.
 
-First, configure the agent. The configs will be saved to `.bedrock_agentcore.yaml`, and the Dockerfile will be saved under `.bedrock_agentcore`.
-
-```bash
-agentcore configure --entrypoint basic_app.py --name strands_math_agent_basic --requirements-file pyproject.toml --deployment-type container --disable-memory --non-interactive
-```
-Then, we can deploy the agent by specifying its name.
+Run from `examples/strands_math_agent`:
 
 ```bash
+agentcore configure --entrypoint basic_app.py --name strands_math_agent_basic \
+  --requirements-file pyproject.toml --deployment-type container --protocol HTTP \
+  --disable-memory --non-interactive
 agentcore deploy --agent strands_math_agent_basic
 ```
 
+The CLI uses the [basic Dockerfile](.bedrock_agentcore/strands_math_agent_basic/Dockerfile).
+
 ### Invoke
 
-To invoke the deployed endpoint, simply use `agentcore invoke` with the payload. Check `agentcore invoke --help` for other optional arguments.
+Invoke the deployed endpoint with a prompt:
 
 ```bash
-agentcore invoke --agent strands_math_agent_basic '{"prompt": "Toula went to the bakery and bought various types of pastries. She bought 3 dozen donuts which cost $68 per dozen, 2 dozen mini cupcakes which cost $80 per dozen, and 6 dozen mini cheesecakes for $55 per dozen. How much was the total cost?"}'
+agentcore invoke --agent strands_math_agent_basic \
+  '{"prompt": "Toula went to the bakery and bought various types of pastries. She bought 3 dozen donuts which cost $68 per dozen, 2 dozen mini cupcakes which cost $80 per dozen, and 6 dozen mini cheesecakes for $55 per dozen. How much was the total cost?"}'
 ```
 
 ## Run RL App Locally with a vLLM Server
 
-The most common setup during RL training is to use a local inference engine to serve the model being trained and generate responses. So, we will try to replicate this setting and let the RL app use a local model.
-
 ### Start a local vLLM server
 
-This step assumes access to GPU locally. To start with, install vLLM in a separate repo and environment
-if needed. Then, start the vLLM server.
+In a separate environment with vLLM installed and a GPU available:
 
 ```bash
-# Assume you are inside examples/strands_math_agent, navigate outside the project repo entirely
-cd ....
-
-# Create a new project directory
-mkdir vllm-server
-cd vllm-server
-
-# Initialize uv env and add vLLM as a dependency
-uv init
-uv add vllm
-
-# Start the vLLM server using Qwen3-4B-Instruct-2507 as an example.
 CUDA_VISIBLE_DEVICES=0 vllm serve Qwen/Qwen3-4B-Instruct-2507 --max-model-len 8192 --port 4000 --enable-auto-tool-choice --tool-call-parser hermes
 ```
 
@@ -107,7 +93,11 @@ reads model config from `_config`, and returns `{"reward": float}`. It supports 
 
 ```bash
 python rl_app.py
+```
 
+Send requests from another terminal:
+
+```bash
 PAYLOAD='"prompt": "Toula went to the bakery and bought various types of pastries. She bought 3 dozen donuts which cost $68 per dozen, 2 dozen mini cupcakes which cost $80 per dozen, and 6 dozen mini cheesecakes for $55 per dozen. How much was the total cost?", "answer": "694", "_config": {"base_url": "http://localhost:4000/v1", "model_id": "Qwen/Qwen3-4B-Instruct-2507"}'
 
 # Ordinary request: returns {"reward": ...}
@@ -120,18 +110,23 @@ curl -X POST http://localhost:8080/invocations -H "Content-Type: application/jso
      -d '{"_agentcore_runtime": {"version": 1, "operation": "get", "invocation_id": "inv1"}}'
 ```
 
-### Deploy
+### Deploy with the AgentCore CLI
 
-If the gateway or inference server uses a private address, deploy the agent
-into its VPC:
+Run from `examples/strands_math_agent`. Set the subnet and security group IDs for the host
+running your inference server or rollout gateway:
 
 ```bash
 agentcore configure --entrypoint rl_app.py --name strands_math_agent_rl \
   --requirements-file pyproject.toml --deployment-type container --protocol HTTP \
-  --vpc --subnets "$SUBNET_ID" --security-groups "$SECURITY_GROUP_ID" \
+  --vpc --subnets subnet-xxxxxxxxxxxxxxxxx --security-groups sg-xxxxxxxxxxxxxxxxx \
   --disable-memory --non-interactive
 agentcore deploy --agent strands_math_agent_rl
 ```
+
+The CLI uses the [RL Dockerfile](.bedrock_agentcore/strands_math_agent_rl/Dockerfile).
+Set `AGENT_RUNTIME_ARN` to the ARN printed by the deployment. For a publicly
+reachable model endpoint, omit the VPC flags.
+Run `agentcore deploy --agent strands_math_agent_rl` for subsequent deployments.
 
 ### Evaluate
 
@@ -147,106 +142,3 @@ python evaluate.py --agent_arn "$AGENT_RUNTIME_ARN" \
 
 Results are appended to `<output_dir>/<exp_id>.jsonl`. Without `--output_dir`,
 they go under the operating system's temporary directory.
-
-## Appendix
-
-The following covers instructions for a set of common dev workflows.
-
-### Run Basic App Inside Docker Locally
-
-```bash
-# Make sure you're in examples/strands_math_agent/
-
-# Build Docker
-docker build -t math:dev --load . -f .bedrock_agentcore/strands_math_agent_basic/Dockerfile
-```
-
-Add AWS credentials to your `.env` file since Docker can't access your host's AWS credential chain:
-
-```bash
-cp .env.example .env
-```
-
-Then edit .env and fill in your own AWS credentials.
-
-```bash
-# Run Docker
-# Note that we override the docker CMD to avoid cluttering error logs due to missing OTLP collector, which is not set up locally.
-docker run -p 8080:8080 --env-file .env math:dev python -m basic_app
-
-# Submit request
-curl -X POST http://localhost:8080/invocations \
-     -H "Content-Type: application/json" \
-     -d '{"prompt": "Toula went to the bakery and bought various types of pastries. She bought 3 dozen donuts which cost $68 per dozen, 2 dozen mini cupcakes which cost $80 per dozen, and 6 dozen mini cheesecakes for $55 per dozen. How much was the total cost?"}'
-```
-
-### Run RL App Inside Docker Locally
-
-Assume the vLLM server has been set up per the instructions above.
-
-```bash
-# Make sure you're in examples/strands_math_agent/
-
-# Build Docker
-docker build --build-context toolkit=../.. -t math_rl:dev --load . -f .bedrock_agentcore/strands_math_agent_dev/Dockerfile
-
-# Run Docker
-# In addition to overriding the docker CMD, we also directly use the host's network so that the agent
-# can access the locally hosted model via http://localhost:4000/v1. Alternatively, replace `localhost`
-# with IP of your machine in BASE_URL and keep the port mapping (-p 8080:8080)
-docker run --network host --env-file .env math_rl:dev python -m rl_app
-
-# Submit request
-curl -X POST http://localhost:8080/invocations \
-     -H "Content-Type: application/json" \
-     -d '{
-       "prompt": "Toula went to the bakery and bought various types of pastries. She bought 3 dozen donuts which cost $68 per dozen, 2 dozen mini cupcakes which cost $80 per dozen, and 6 dozen mini cheesecakes for $55 per dozen. How much was the total cost?",
-       "answer": "694",
-       "_config": {
-         "base_url": "http://localhost:4000/v1",
-         "model_id": "Qwen/Qwen3-4B-Instruct-2507"
-       }
-     }'
-```
-
-### Build Docker images for ACR
-Currently, ACR requires ARM64 containers (AWS Graviton), so only containers built on ARM64 machines will work when deployed to agentcore runtime. By default, the `AgentCore CLI` handles this automatically by building ARM64 containers in the cloud with CodeBuild. But if you want to test or debug, you can also build to ARM64 locally using `docker buildx`.
-
-```bash
-# Run only once
-docker buildx create --use
-
-docker buildx build --build-context toolkit=../.. --platform linux/arm64 -t math_rl:dev --load . -f .bedrock_agentcore/strands_math_agent_dev/Dockerfile
-```
-
-### Manual deployment
-Instead of letting `AgentCore CLI` handle everything, we can also build docker image (ARM64) and push to ECR on our own. See `scripts/build_docker_image_and_push_to_ecr.sh` for more detail.
-
-We can also use an existing IAM role for the agent's execution role instead of using the auto-generated one. See [doc](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-permissions.html) for essential permissions for ACR.
-
-```bash
-agentcore configure -e my_agent.py --execution-role arn:aws:iam::111122223333:role/MyRole
-```
-
-And in general, for more manual control over deployment, you can use boto3.
-
-```python
-import boto3
-
-# Create the client
-client = boto3.client('bedrock-agentcore-control', region_name="us-east-1")
-
-# Call the CreateAgentRuntime operation
-response = client.create_agent_runtime(
-    agentRuntimeName='hello-strands',
-    agentRuntimeArtifact={
-        'containerConfiguration': {
-            # Your ECR image Uri
-            'containerUri': '123456789012.dkr.ecr.us-east-1.amazonaws.com/my-agent:latest'
-        }
-    },
-    networkConfiguration={"networkMode":"PUBLIC"},
-    # Your AgentCore Runtime role arn
-    roleArn='arn:aws:iam::123456789012:role/AgentRuntimeRole'
-)
-```

@@ -65,6 +65,7 @@ tests/
 .bedrock_agentcore.yaml
 .dockerignore
 .bedrock_agentcore/
+.env.*
 
 # Keep wheelhouse for offline installations
 # wheelhouse/
