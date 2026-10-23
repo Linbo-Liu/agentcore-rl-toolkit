@@ -20,7 +20,7 @@ of your production code intact.
 
 ## 📰 News
 
-- **[2026/10]** Day-0 support for [Amazon SageMaker Training Sessions](https://aws.amazon.com/about-aws/whats-new/2026/10/training-session-apis-on-sagemaker-ai/): train AgentCore Runtime agents with no GPU cluster to manage — a GSM8K agent on GPT-OSS-20B goes from 3% → 83% eval accuracy. See the [setup guide](https://awslabs.github.io/agentcore-rl-toolkit/guides/sagemaker-backend-setup/).
+- **[2026/10]** Day-0 support for [Amazon SageMaker Training Sessions](https://aws.amazon.com/about-aws/whats-new/2026/10/training-session-apis-on-sagemaker-ai/): train your agents on AgentCore and SageMaker with no GPU cluster to manage — a GSM8K agent on GPT-OSS-20B goes from 3% → 83% eval accuracy. See the [setup guide](https://awslabs.github.io/agentcore-rl-toolkit/guides/sagemaker-backend-setup/).
 
 ## 🎯 Agents We've Trained
 
@@ -171,6 +171,7 @@ for token-level trajectory capture.
 | **slime** | Self-hosted training with slime | [Setup guide](src/agentcore_rl_toolkit/backends/slime/examples/math_agent/SETUP.md) |
 | **SkyRL** | Self-hosted training through its Tinker-compatible API | [Training guide](src/agentcore_rl_toolkit/backends/tinker_api/README.md) · [Deployment example](src/agentcore_rl_toolkit/backends/tinker_api/skyrl/README.md) |
 | **Tinker** | Managed training through the official Tinker API | [Training guide](src/agentcore_rl_toolkit/backends/tinker_api/README.md) |
+| **SageMaker** | Managed training through Amazon SageMaker Training Sessions | [Setup guide](src/agentcore_rl_toolkit/backends/experimental/sagemaker/SETUP.md) |
 
 SkyRL and Tinker share the toolkit's Tinker-compatible API integration.
 
