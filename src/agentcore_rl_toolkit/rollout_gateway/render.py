@@ -11,9 +11,10 @@ HF rendering behind the :class:`Renderer` protocol:
 * :class:`HfTemplateRenderer` (default, lightweight) — renders with the HF tokenizer's
   ``apply_chat_template``. Derendering picks the strongest available path: when the
   tokenizer's chat template is recognized (:func:`response_schemas.resolve_schema_name`),
-  the whole output is parsed in one pass via ``tokenizer.parse_response`` with the
-  matching response schema — reasoning, text, and tool calls together, in the model's
-  actual format. Otherwise it falls back to two stages — a reasoning parser then a
+  the whole output is parsed in one pass via ``tokenizer.parse_response`` — reasoning,
+  text, and tool calls together, in the model's actual format. On transformers >= 5.13
+  this uses a new-style ``response_template`` (the tokenizer's own, else the vendored
+  one); older versions use the legacy response schema. Otherwise it falls back to two stages — a reasoning parser then a
   tool parser — each independently overridable via ``reasoning_parser`` /
   ``tool_parser`` and each defaulting to the dependency-free implementation
   (``</think>`` split / ``<tool_call><function=...>`` regex). Passing either stage
@@ -31,6 +32,9 @@ from typing import Any, Protocol, runtime_checkable
 from .parsing import split_reasoning
 from .response_schemas import (
     RESPONSE_SCHEMAS,
+    RESPONSE_TEMPLATES,
+    SUPPORTS_PARSE_RESPONSE_TOOLS,
+    SUPPORTS_RESPONSE_TEMPLATE,
     patch_chat_template,
     reasoning_render_key,
     resolve_schema_name,
@@ -153,6 +157,8 @@ class HfTemplateRenderer:
         # available by explicit injection.
         self.tool_parser: ToolParserFn | None = tool_parser
         self._schema: dict | None = None
+        self._template: dict | None = None
+        self._parse_prefix: str | None = None
         # Render-side template repair, independent of the parse path: some templates do
         # not render what their model generates, which breaks prefix reuse on replay.
         # Held here and passed per-call rather than assigned onto the tokenizer, so a
@@ -171,7 +177,12 @@ class HfTemplateRenderer:
         if reasoning_parser is None and tool_parser is None:
             # tokenizer.parse_response is guaranteed by the transformers>=5.0 floor
             # (the [gateway] extra); no availability guard needed.
-            if schema_name is not None:
+            native = getattr(tokenizer, "response_template", None) if SUPPORTS_RESPONSE_TEMPLATE else None
+            if isinstance(native, dict):
+                self._template = native
+            elif schema_name is not None and SUPPORTS_RESPONSE_TEMPLATE:
+                self._template = RESPONSE_TEMPLATES[schema_name]
+            elif schema_name is not None:
                 self._schema = RESPONSE_SCHEMAS[schema_name]
         # Pin the Rust backend's ``encode_special_tokens`` once, at construction.
         # The property setter takes a mutable borrow on the Tokenizer, and
@@ -328,6 +339,8 @@ class HfTemplateRenderer:
         tools_schema: list[dict] | None = None,
     ) -> ParsedOutput:
         raw_output = self.tokenizer.decode(output_ids, skip_special_tokens=False) if output_ids else ""
+        if self._template is not None:
+            return self._parse_with_template(raw_output, tools_schema)
         if self._schema is not None:
             return self._parse_with_schema(raw_output)
         if tools_schema and self.tool_parser is None:
@@ -352,6 +365,34 @@ class HfTemplateRenderer:
             ill_formed=ill_formed,
         )
 
+    def _generation_prefix(self) -> str:
+        """The prompt tail the template prefills before generation (e.g. an open ``<think>``).
+
+        ``parse_response`` truncates its ``prefix`` past the template's last start anchor,
+        so a one-message conversation rendered with the generation prompt carries the
+        same prefill as every real prompt from this renderer.
+        """
+        if self._parse_prefix is None:
+            try:
+                self._parse_prefix = self._render_text([{"role": "user", "content": "."}])
+            except Exception as e:
+                logger.warning("could not render the generation prompt for parsing (%s); using no prefix", e)
+                self._parse_prefix = ""
+        return self._parse_prefix
+
+    def _parse_with_template(self, raw_output: str, tools_schema: list[dict] | None) -> ParsedOutput:
+        # With tools, transformers >= 5.15 types each argument from its tool's JSON
+        # schema; a tool name outside the schema still parses, for the agent to reject.
+        tools = {"tools": tools_schema} if tools_schema and SUPPORTS_PARSE_RESPONSE_TOOLS else {}
+        try:
+            parsed = self.tokenizer.parse_response(
+                raw_output, schema=self._template, prefix=self._generation_prefix(), **tools
+            )
+        except Exception as e:
+            logger.warning("response-template parse failed (%s); degrading to raw text", e)
+            parsed = None
+        return self._from_parsed(parsed, raw_output)
+
     def _parse_with_schema(self, raw_output: str) -> ParsedOutput:
         # The tools schema is deliberately not passed: response schemas describe the
         # model's output format, not the offered tools, so parsing never filters by
@@ -359,13 +400,14 @@ class HfTemplateRenderer:
         # reject. parse_response also accepts token ids, but only to decode them
         # internally (parsing is text-level); decoding ourselves keeps a single
         # decode with our flags on every path, including the ill_formed fallback.
-        # The >=5.13 template API adds a `prefix=` (prompt) argument for
-        # template-prefilled regions; adopting it will need prompt ids at this seam.
         try:
             parsed = self.tokenizer.parse_response(raw_output, schema=self._schema)
         except Exception as e:
             logger.warning("response-schema parse failed (%s); degrading to raw text", e)
             parsed = None
+        return self._from_parsed(parsed, raw_output)
+
+    def _from_parsed(self, parsed: Any, raw_output: str) -> ParsedOutput:
         if not isinstance(parsed, dict):
             # None = the schema's anchored regex did not match (e.g. output truncated
             # mid-tool-call). Degrade in place, flagged — never fail the turn.
@@ -384,7 +426,8 @@ class HfTemplateRenderer:
                 return ParsedOutput(reasoning="", text=raw_output, tool_uses=[], ill_formed=True)
             tool_uses.append({"name": fn["name"], "input": args})
         return ParsedOutput(
-            reasoning=parsed.get("reasoning_content") or "",
+            # GPT-OSS's template names its reasoning field ``thinking``.
+            reasoning=parsed.get("reasoning_content") or parsed.get("thinking") or "",
             text=parsed.get("content") or "",
             tool_uses=tool_uses,
             ill_formed=False,
