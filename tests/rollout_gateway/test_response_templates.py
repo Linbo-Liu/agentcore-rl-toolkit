@@ -141,9 +141,9 @@ def test_glm4moe_template_parses_native_output():
     "call",
     [
         # What the model generates: the recipient on the channel line, content type "code".
-        "<|channel|>commentary to=functions.read code<|message|>{\"path\": \"a.py\"}<|call|>",
+        '<|channel|>commentary to=functions.read code<|message|>{"path": "a.py"}<|call|>',
         # What the stock template renders: the recipient in the role header.
-        " to=functions.read<|channel|>commentary json<|message|>{\"path\": \"a.py\"}<|call|>",
+        ' to=functions.read<|channel|>commentary json<|message|>{"path": "a.py"}<|call|>',
     ],
 )
 def test_gptoss_template_parses_both_recipient_positions(call):
