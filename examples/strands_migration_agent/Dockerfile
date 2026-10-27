@@ -22,11 +22,9 @@ RUN echo "=== Java Installation Verification ===" && \
     java --version && \
     which java
 
-# Set JAVA_HOME (apt's openjdk does not). maven-javadoc-plugin 2.9.1-3.2.0
-# cannot locate javadoc on JDK 17 without it. Resolve the path at build time
-# since the JDK directory name is arch-specific (amd64 vs arm64).
+# Set JAVA_HOME. Make pagers disabled for non-interactive git.
 RUN ln -s "$(dirname "$(dirname "$(readlink -f "$(which javac)")")")" /opt/java-home
-ENV JAVA_HOME=/opt/java-home
+ENV JAVA_HOME=/opt/java-home GIT_PAGER=cat PAGER=cat
 
 # 2. Install maven
 # install tools needed for Maven first
@@ -66,11 +64,6 @@ RUN apt-get update && \
 
 COPY . .
 RUN uv pip install . aws-opentelemetry-distro==0.12.2
-
-
-# Inherited by both agent tools and reward subprocesses.
-RUN ln -s "/usr/lib/jvm/java-17-openjdk-$(dpkg --print-architecture)" /opt/java-home
-ENV JAVA_HOME=/opt/java-home GIT_PAGER=cat PAGER=cat
 
 # Create non-root user
 RUN useradd -m -u 1000 bedrock_agentcore
