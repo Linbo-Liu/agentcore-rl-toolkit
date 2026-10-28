@@ -291,7 +291,7 @@ materialized rollout sessions in each actor update, summed over a step's updates
 
 ## Score function centering
 
-Set `num_token_samples: K` in the agent-loop YAML and export
+Set `num_auxiliary_token_samples: K` in the agent-loop YAML and export
 `AGENTCORE_VLLM_TOKEN_SAMPLES=1` to replace the policy loss with a ratio-free,
 score-centered REINFORCE plus a sampler-learner KL weighted by token age
 (`sfc_kl_beta`, β₀). vLLM draws `K` tokens per generated token from the sampling

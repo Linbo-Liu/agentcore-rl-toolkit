@@ -82,12 +82,12 @@ def _sampled_turn(token_ids, k=2, version=3):
 @pytest.mark.asyncio
 async def test_agent_loop_aligns_draws_to_logits_rows_across_turns():
     llm = FakeLLMServerClient([_sampled_turn([101, 102], version=3), _sampled_turn([101, 102], version=4)])
-    loop = _make_loop(llm, num_token_samples=2)
+    loop = _make_loop(llm, num_auxiliary_token_samples=2)
     _wire_result(loop, {"reward": 1.0}, drive_turns=2)
 
     (out,) = await loop.run({"temperature": 1.0}, raw_prompt=[{"role": "user", "content": "hi"}], payload={})
 
-    assert [call["sampling_params"]["num_token_samples"] for call in llm.calls] == [2, 2]
+    assert [call["sampling_params"]["num_auxiliary_token_samples"] for call in llm.calls] == [2, 2]
     assert isinstance(out, _TokenSamplesOutput)
     fields = out.as_dict()
     draws, versions = fields[sc.SAMPLE_IDS_KEY], fields[sc.SAMPLE_VERSIONS_KEY]
@@ -106,7 +106,7 @@ async def test_agent_loop_aligns_draws_to_logits_rows_across_turns():
 
 @pytest.mark.asyncio
 async def test_agent_loop_requires_draws_for_trained_tokens():
-    loop = _make_loop(FakeLLMServerClient(), num_token_samples=2)
+    loop = _make_loop(FakeLLMServerClient(), num_auxiliary_token_samples=2)
     _wire_result(loop, {"reward": 1.0})
     with pytest.raises(RuntimeError, match="trained tokens without sampler draws"):
         await loop.run({}, raw_prompt=[{"role": "user", "content": "hi"}], payload={})

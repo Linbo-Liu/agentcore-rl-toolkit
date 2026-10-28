@@ -44,7 +44,7 @@ class BaseTrace:
 
 
 @dataclass(frozen=True)
-class TokenSamples:
+class AuxiliaryTokenSamples:
     """``K`` extra sampler draws per generated token, not appended to the sequence.
 
     ``ids`` is ``(n, K)``: row ``i`` holds tokens drawn from the distribution token ``i``
@@ -57,8 +57,8 @@ class TokenSamples:
     def __len__(self) -> int:
         return len(self.ids)
 
-    def prefix(self, n: int) -> "TokenSamples":
-        return TokenSamples(self.ids[:n], None if self.versions is None else self.versions[:n])
+    def prefix(self, n: int) -> "AuxiliaryTokenSamples":
+        return AuxiliaryTokenSamples(self.ids[:n], None if self.versions is None else self.versions[:n])
 
 
 @dataclass
@@ -81,7 +81,7 @@ class TraceRecord:
     metadata: dict = field(default_factory=dict)
     status: Status = Status.COMPLETED
     # (offset into the response region, draws) for trained tokens.
-    token_samples: list[tuple[int, TokenSamples]] = field(default_factory=list)
+    auxiliary_token_samples: list[tuple[int, AuxiliaryTokenSamples]] = field(default_factory=list)
 
     # Off-policy / MoE fields (weight_version, routed_experts) are intentionally
     # omitted for now; add them as optional fields if a consumer needs them.
@@ -98,4 +98,4 @@ class TraceRecord:
             )
 
 
-__all__ = ["BaseTrace", "Status", "TokenSamples", "TraceRecord"]
+__all__ = ["BaseTrace", "Status", "AuxiliaryTokenSamples", "TraceRecord"]

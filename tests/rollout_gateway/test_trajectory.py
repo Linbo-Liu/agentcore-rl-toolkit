@@ -11,10 +11,10 @@ import sys
 import pytest
 
 from agentcore_rl_toolkit.rollout_gateway import (
+    AuxiliaryTokenSamples,
     BaseTrace,
     MessageNode,
     Status,
-    TokenSamples,
     TraceRecord,
     TrajectoryManager,
     TurnRecord,
@@ -213,21 +213,26 @@ def test_ill_formed_propagates_to_metadata():
 
 def _samples(*tokens):
     """Distinguishable 2-sample rows per output token: row i = [token, token + 100]."""
-    return TokenSamples(ids=[[t, t + 100] for t in tokens], versions=[t % 3 for t in tokens])
+    return AuxiliaryTokenSamples(ids=[[t, t + 100] for t in tokens], versions=[t % 3 for t in tokens])
 
 
 def test_token_samples_follow_trained_responses():
     mgr = TrajectoryManager()
     mgr.record_turn(
         "s",
-        turn=TurnRecord(prompt_ids=[1, 2, 3], output_ids=[4, 5], finish_reason="stop", output_samples=_samples(4, 5)),
+        turn=TurnRecord(
+            prompt_ids=[1, 2, 3], output_ids=[4, 5], finish_reason="stop", output_auxiliary_token_samples=_samples(4, 5)
+        ),
         prompt_messages=[_um("hi")],
         response_message=_am("a"),
     )
     mgr.record_turn(
         "s",
         turn=TurnRecord(
-            prompt_ids=[1, 2, 3, 4, 5, 6], output_ids=[7], finish_reason="stop", output_samples=_samples(7)
+            prompt_ids=[1, 2, 3, 4, 5, 6],
+            output_ids=[7],
+            finish_reason="stop",
+            output_auxiliary_token_samples=_samples(7),
         ),
         prompt_messages=[_um("hi"), _am("a"), _um("more")],
         response_message=_am("b"),
@@ -235,14 +240,16 @@ def test_token_samples_follow_trained_responses():
     r = mgr.get_trajectory("s", base_sample=BaseTrace(index=0))[0]
     # response region [4, 5, 6, 7]: the observation 6 has no samples
     assert r.loss_mask == [1, 1, 0, 1]
-    assert [(offset, s.ids) for offset, s in r.token_samples] == [(0, [[4, 104], [5, 105]]), (3, [[7, 107]])]
+    assert [(offset, s.ids) for offset, s in r.auxiliary_token_samples] == [(0, [[4, 104], [5, 105]]), (3, [[7, 107]])]
 
 
 def test_token_samples_omitted_for_responses_reemitted_as_context():
     mgr = TrajectoryManager()
     mgr.record_turn(
         "s",
-        turn=TurnRecord(prompt_ids=[1, 2, 3], output_ids=[4, 5], finish_reason="stop", output_samples=_samples(4, 5)),
+        turn=TurnRecord(
+            prompt_ids=[1, 2, 3], output_ids=[4, 5], finish_reason="stop", output_auxiliary_token_samples=_samples(4, 5)
+        ),
         prompt_messages=[_um("hi")],
         response_message=_am("a"),
     )
@@ -250,16 +257,19 @@ def test_token_samples_omitted_for_responses_reemitted_as_context():
         mgr.record_turn(
             "s",
             turn=TurnRecord(
-                prompt_ids=[1, 2, 3, 4, 5, obs], output_ids=[out], finish_reason="stop", output_samples=_samples(out)
+                prompt_ids=[1, 2, 3, 4, 5, obs],
+                output_ids=[out],
+                finish_reason="stop",
+                output_auxiliary_token_samples=_samples(out),
             ),
             prompt_messages=[_um("hi"), _am("a"), _um(f"tool {obs}")],
             response_message=_am("b"),
         )
     first, second = mgr.get_trajectory("s", base_sample=BaseTrace(index=0))
-    assert [offset for offset, _ in first.token_samples] == [0, 3]
+    assert [offset for offset, _ in first.auxiliary_token_samples] == [0, 3]
     # the shared response trains on the first leaf only, so only the second leaf's own samples remain
     assert second.loss_mask == [0, 0, 0, 1]
-    assert [(offset, s.ids) for offset, s in second.token_samples] == [(3, [[9, 109]])]
+    assert [(offset, s.ids) for offset, s in second.auxiliary_token_samples] == [(3, [[9, 109]])]
 
 
 def test_token_samples_truncated_with_max_sample_tokens():
@@ -267,14 +277,17 @@ def test_token_samples_truncated_with_max_sample_tokens():
     mgr.record_turn(
         "s",
         turn=TurnRecord(
-            prompt_ids=[1, 2], output_ids=[4, 5, 6], finish_reason="stop", output_samples=_samples(4, 5, 6)
+            prompt_ids=[1, 2],
+            output_ids=[4, 5, 6],
+            finish_reason="stop",
+            output_auxiliary_token_samples=_samples(4, 5, 6),
         ),
         prompt_messages=[_um("hi")],
         response_message=_am("a"),
     )
     r = mgr.get_trajectory("s", base_sample=BaseTrace(index=0), max_sample_tokens=4)[0]
     assert r.loss_mask == [1, 1]
-    ((offset, samples),) = r.token_samples
+    ((offset, samples),) = r.auxiliary_token_samples
     assert offset == 0
     assert samples.ids == [[4, 104], [5, 105]]
     assert samples.versions == [1, 2]

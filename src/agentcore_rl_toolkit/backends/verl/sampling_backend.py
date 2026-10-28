@@ -14,7 +14,7 @@ per-turn engine request id internally.
 import logging
 from typing import Any
 
-from agentcore_rl_toolkit.rollout_gateway.trace import TokenSamples
+from agentcore_rl_toolkit.rollout_gateway.trace import AuxiliaryTokenSamples
 from agentcore_rl_toolkit.rollout_gateway.trajectory import TurnRecord
 
 logger = logging.getLogger(__name__)
@@ -48,10 +48,10 @@ def _verl_sampling_params(sp: dict) -> dict:
     return body
 
 
-def _output_samples(extra: dict[str, Any], num_tokens: int) -> TokenSamples | None:
+def _output_auxiliary_token_samples(extra: dict[str, Any], num_tokens: int) -> AuxiliaryTokenSamples | None:
     if "response_sample_ids" not in extra:
         return None
-    samples = TokenSamples(extra["response_sample_ids"], extra.get("response_sample_versions"))
+    samples = AuxiliaryTokenSamples(extra["response_sample_ids"], extra.get("response_sample_versions"))
     if len(samples) != num_tokens:
         raise RuntimeError(f"verl returned token samples for {len(samples)} of {num_tokens} generated tokens")
     return samples
@@ -76,11 +76,13 @@ class VerlSamplingBackend:
         session_id: str | None = None,
         image_data: Any = None,
         video_data: Any = None,
-        num_token_samples: int = 0,
+        num_auxiliary_token_samples: int = 0,
     ) -> TurnRecord:
         params = _verl_sampling_params(sampling_params)
-        if num_token_samples:
-            params["num_token_samples"] = num_token_samples  # read by score_centering's server patch
+        if num_auxiliary_token_samples:
+            params[
+                "num_auxiliary_token_samples"
+            ] = num_auxiliary_token_samples  # read by score_centering's server patch
         max_new_tokens = params["max_new_tokens"]
         output = await self.server_manager.generate(
             request_id=session_id or "default",
@@ -117,7 +119,7 @@ class VerlSamplingBackend:
             output_ids=output_ids,
             finish_reason=finish_reason,
             output_log_probs=log_probs,
-            output_samples=_output_samples(extra, len(output_ids)),
+            output_auxiliary_token_samples=_output_auxiliary_token_samples(extra, len(output_ids)),
         )
 
     def _fold_extra_fields(self, sid: str, extra: dict[str, Any]) -> None:

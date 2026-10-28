@@ -63,11 +63,11 @@ async def _engine_generate(self, *args, **kwargs):
 
 async def _server_generate(self, prompt_ids, sampling_params, request_id, *args, **kwargs):
     generate = _ORIGINAL["vLLMHttpServer.generate"]
-    k = int(sampling_params.pop("num_token_samples", 0) or 0)
+    k = int(sampling_params.pop("num_auxiliary_token_samples", 0) or 0)
     if k <= 0:
         return await generate(self, prompt_ids, sampling_params, request_id, *args, **kwargs)
     if not samples_enabled():
-        raise RuntimeError(f"num_token_samples needs {SAMPLES_ENV}=1 on the rollout workers")
+        raise RuntimeError(f"num_auxiliary_token_samples needs {SAMPLES_ENV}=1 on the rollout workers")
     request = {"k": k, "final": None}
     token = _REQUEST.set(request)
     try:
@@ -133,14 +133,14 @@ def install() -> None:
         server.vLLMHttpServer.generate = _server_generate
 
 
-def sample_fields(token_samples, k: int, prompt_length: int, response_length: int) -> dict:
+def sample_fields(auxiliary_token_samples, k: int, prompt_length: int, response_length: int) -> dict:
     """The draws and their weight versions per logits row: response token ``r`` is row ``prompt_length - 1 + r``."""
     import torch
 
     seq_len = prompt_length + response_length
     draws = torch.zeros((seq_len, k), dtype=torch.int32)
     versions = torch.full((seq_len,), -1, dtype=torch.int64)
-    for offset, samples in token_samples:
+    for offset, samples in auxiliary_token_samples:
         start = prompt_length - 1 + offset
         draws[start : start + len(samples)] = torch.as_tensor(np.asarray(samples.ids), dtype=torch.int32)
         if samples.versions is not None:

@@ -148,11 +148,11 @@ def _sampled_output(token_ids, k=2, **extra):
 async def test_generate_maps_token_samples():
     client = FakeLLMServerClient([_sampled_output([5, 6], global_steps=3)])
     backend = VerlSamplingBackend(client)
-    turn = await backend.generate(prompt_ids=[1], sampling_params={}, session_id="s", num_token_samples=2)
+    turn = await backend.generate(prompt_ids=[1], sampling_params={}, session_id="s", num_auxiliary_token_samples=2)
 
-    assert client.calls[0]["sampling_params"]["num_token_samples"] == 2
-    assert turn.output_samples.ids.tolist() == [[0, 1], [2, 3]]
-    assert turn.output_samples.versions.tolist() == [3, 3]
+    assert client.calls[0]["sampling_params"]["num_auxiliary_token_samples"] == 2
+    assert turn.output_auxiliary_token_samples.ids.tolist() == [[0, 1], [2, 3]]
+    assert turn.output_auxiliary_token_samples.versions.tolist() == [3, 3]
     # samples are per-turn data, not folded into the per-session extra fields
     assert backend.pop_extra_fields("s") == {"global_steps": 3}
 
@@ -161,8 +161,8 @@ async def test_generate_maps_token_samples():
 async def test_generate_without_token_samples():
     client = FakeLLMServerClient([TokenOutput(token_ids=[5], stop_reason="completed")])
     turn = await VerlSamplingBackend(client).generate(prompt_ids=[1], sampling_params={}, session_id="s")
-    assert turn.output_samples is None
-    assert "num_token_samples" not in client.calls[0]["sampling_params"]
+    assert turn.output_auxiliary_token_samples is None
+    assert "num_auxiliary_token_samples" not in client.calls[0]["sampling_params"]
 
 
 @pytest.mark.asyncio
@@ -172,4 +172,4 @@ async def test_generate_rejects_misaligned_token_samples():
         output.extra_fields[key] = output.extra_fields[key][:1]
     backend = VerlSamplingBackend(FakeLLMServerClient([output]))
     with pytest.raises(RuntimeError, match="token samples for 1 of 2 generated tokens"):
-        await backend.generate(prompt_ids=[1], sampling_params={}, session_id="s", num_token_samples=2)
+        await backend.generate(prompt_ids=[1], sampling_params={}, session_id="s", num_auxiliary_token_samples=2)

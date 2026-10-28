@@ -17,7 +17,7 @@ from typing import Any
 
 import aiohttp
 
-from ..trace import TokenSamples
+from ..trace import AuxiliaryTokenSamples
 from ..trajectory import TurnRecord
 from .vllm_token_samples import SAMPLES_ENV
 
@@ -70,19 +70,19 @@ def _tokens_and_logprobs_from_choice(choice: dict) -> tuple[list[int], list[floa
     return tids, [0.0] * len(tids)
 
 
-def _token_samples_from_choice(choice: dict, num_tokens: int, k: int) -> TokenSamples:
+def _auxiliary_token_samples_from_choice(choice: dict, num_tokens: int, k: int) -> AuxiliaryTokenSamples:
     """Draws from each position's ``top_logprobs`` (entry 0 is the sampled token)."""
     content = (choice.get("logprobs") or {}).get("content") or []
     rows = [[int(e["token"].removeprefix("token_id:")) for e in step.get("top_logprobs") or []] for step in content]
     if len(rows) != num_tokens or any(len(row) != k + 1 for row in rows):
         raise RuntimeError(f"vLLM did not return {k} token samples per position; is it running {SAMPLES_ENV}=1?")
-    return TokenSamples([row[1:] for row in rows])
+    return AuxiliaryTokenSamples([row[1:] for row in rows])
 
 
 class VllmHttpBackend:
     """``SamplingBackend`` over a vLLM ``/inference/v1/generate`` endpoint.
 
-    ``num_token_samples`` needs the server started with the ``vllm_token_samples``
+    ``num_auxiliary_token_samples`` needs the server started with the ``vllm_token_samples``
     plugin enabled (``AGENTCORE_VLLM_TOKEN_SAMPLES=1``).
     """
 
@@ -98,11 +98,11 @@ class VllmHttpBackend:
         session_id: str | None = None,
         image_data: Any = None,
         video_data: Any = None,
-        num_token_samples: int = 0,
+        num_auxiliary_token_samples: int = 0,
     ) -> TurnRecord:
         body = _vllm_sampling_body(sampling_params)
-        if num_token_samples:
-            body.update(logprobs=num_token_samples, flat_logprobs=True)
+        if num_auxiliary_token_samples:
+            body.update(logprobs=num_auxiliary_token_samples, flat_logprobs=True)
         payload: dict[str, Any] = {"token_ids": list(prompt_ids), "sampling_params": body}
         if image_data:
             payload["images"] = image_data
@@ -143,8 +143,10 @@ class VllmHttpBackend:
             output_ids=output_ids,
             finish_reason=finish,
             output_log_probs=output_log_probs,
-            output_samples=(
-                _token_samples_from_choice(choice, len(output_ids), num_token_samples) if num_token_samples else None
+            output_auxiliary_token_samples=(
+                _auxiliary_token_samples_from_choice(choice, len(output_ids), num_auxiliary_token_samples)
+                if num_auxiliary_token_samples
+                else None
             ),
         )
 

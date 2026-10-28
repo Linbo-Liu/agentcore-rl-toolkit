@@ -1,4 +1,4 @@
-"""vLLM plugin: per-token sampler draws (``SamplingBackend`` ``num_token_samples``).
+"""vLLM plugin: per-token sampler draws (``SamplingBackend`` ``num_auxiliary_token_samples``).
 
 With ``AGENTCORE_VLLM_TOKEN_SAMPLES=1``, a sampled-token ``logprobs=K`` request returns
 ``K`` i.i.d. draws from the processed sampling distribution in place of the top-``K``

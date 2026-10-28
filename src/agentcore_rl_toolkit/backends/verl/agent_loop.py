@@ -31,7 +31,7 @@ from verl.experimental.agent_loop.agent_loop import (
 
 from agentcore_rl_toolkit.aws_tools.persistent_dict import NullPersister, PersistentDict
 from agentcore_rl_toolkit.concurrency.ray_adapters import RayPrioritySemaphore, RayRateLimiter
-from agentcore_rl_toolkit.rollout_gateway import BaseTrace, TokenSamples, TraceRecord
+from agentcore_rl_toolkit.rollout_gateway import AuxiliaryTokenSamples, BaseTrace, TraceRecord
 from agentcore_rl_toolkit.rollout_session.errors import RolloutContractError
 from agentcore_rl_toolkit.rollout_session.factory import make_session
 
@@ -52,13 +52,17 @@ def _extract_agent_reward(result: dict) -> float:
 class _TokenSamplesOutput(AgentLoopOutput):
     """Adds the per-token draws and their weight versions, aligned to logits rows."""
 
-    _token_samples: list[tuple[int, TokenSamples]] = PrivateAttr(default_factory=list)
-    _num_token_samples: int = PrivateAttr(default=0)
+    _auxiliary_token_samples: list[tuple[int, AuxiliaryTokenSamples]] = PrivateAttr(default_factory=list)
+    _num_auxiliary_token_samples: int = PrivateAttr(default=0)
 
     def as_dict(self) -> dict[str, Any]:
         output = super().as_dict()
         prompt_length, response_length = output["prompts"].size(0), output["responses"].size(0)
-        output.update(sample_fields(self._token_samples, self._num_token_samples, prompt_length, response_length))
+        output.update(
+            sample_fields(
+                self._auxiliary_token_samples, self._num_auxiliary_token_samples, prompt_length, response_length
+            )
+        )
         return output
 
 
@@ -95,7 +99,7 @@ class AgentCoreAgentLoop(AgentLoopBase):
         reward_extra_info_defaults: dict | None = None,
         # {name: threshold} -> emit reward_extra_info[name] = 1.0 if reward >= threshold.
         reward_thresholds: dict | None = None,
-        num_token_samples: int = 0,  # > 0 enables score centering (score_centering.py)
+        num_auxiliary_token_samples: int = 0,  # > 0 enables score centering (score_centering.py)
         **kwargs,  # swallows the YAML entry's `name`, verl's `tools`, and future kwargs
     ):
         super().__init__(trainer_config, server_manager, tokenizer, processor, dataset_cls, data_config, **kwargs)
@@ -133,9 +137,11 @@ class AgentCoreAgentLoop(AgentLoopBase):
             for value in (rollout_concurrency, tps_limit)
         ):
             raise ValueError("rollout_concurrency and tps_limit must be positive integers")
-        if type(num_token_samples) is not int or num_token_samples < 0:  # noqa: E721 - reject bool
-            raise ValueError(f"num_token_samples must be a non-negative integer, got {num_token_samples!r}")
-        self.num_token_samples = num_token_samples
+        if type(num_auxiliary_token_samples) is not int or num_auxiliary_token_samples < 0:  # noqa: E721 - reject bool
+            raise ValueError(
+                f"num_auxiliary_token_samples must be a non-negative integer, got {num_auxiliary_token_samples!r}"
+            )
+        self.num_auxiliary_token_samples = num_auxiliary_token_samples
         # Kept as config, not inlined, so a validated trainer-side mode can land
         # without a signature change. Reward semantics: see the README.
         self.reward_mode = reward_mode
@@ -215,7 +221,7 @@ class AgentCoreAgentLoop(AgentLoopBase):
             sid,
             sampling_defaults=self._sampling_defaults(sampling_params),
             max_context_tokens=self.max_context_tokens,
-            num_token_samples=self.num_token_samples,
+            num_auxiliary_token_samples=self.num_auxiliary_token_samples,
         )
 
         result: dict[str, Any] = {}
@@ -387,13 +393,15 @@ class AgentCoreAgentLoop(AgentLoopBase):
         response_mask = [0] * len(prompt_overflow) + response_mask
         response_logprobs = [0.0] * len(prompt_overflow) + response_logprobs
 
-        token_samples = [(len(prompt_overflow) + offset, samples) for offset, samples in record.token_samples]
-        if self.num_token_samples:
-            covered = {offset + i for offset, samples in token_samples for i in range(len(samples))}
+        auxiliary_token_samples = [
+            (len(prompt_overflow) + offset, samples) for offset, samples in record.auxiliary_token_samples
+        ]
+        if self.num_auxiliary_token_samples:
+            covered = {offset + i for offset, samples in auxiliary_token_samples for i in range(len(samples))}
             if any(trained and i not in covered for i, trained in enumerate(response_mask)):
                 raise RuntimeError("trained tokens without sampler draws; is AGENTCORE_VLLM_TOKEN_SAMPLES=1 set?")
 
-        output = (_TokenSamplesOutput if self.num_token_samples else AgentLoopOutput)(
+        output = (_TokenSamplesOutput if self.num_auxiliary_token_samples else AgentLoopOutput)(
             prompt_ids=prompt_ids,
             response_ids=response_ids,
             response_mask=response_mask,
@@ -410,9 +418,9 @@ class AgentCoreAgentLoop(AgentLoopBase):
                 "reward_extra_info": dict(shared_extra.get("reward_extra_info") or {}),
             },
         )
-        if self.num_token_samples:
-            output._token_samples = token_samples
-            output._num_token_samples = self.num_token_samples
+        if self.num_auxiliary_token_samples:
+            output._auxiliary_token_samples = auxiliary_token_samples
+            output._num_auxiliary_token_samples = self.num_auxiliary_token_samples
         return output
 
 

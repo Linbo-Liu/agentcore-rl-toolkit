@@ -1,5 +1,5 @@
 """Token-sample draws over vLLM's ``/inference/v1/generate``: the endpoint patch keeps
-duplicate draws, and ``VllmHttpBackend`` parses them into ``TurnRecord.output_samples``."""
+duplicate draws, and ``VllmHttpBackend`` parses them into ``TurnRecord.output_auxiliary_token_samples``."""
 
 import pytest
 from aiohttp import web
@@ -40,12 +40,12 @@ async def test_vllm_http_backend_returns_draws():
     server, seen = await _serve(choice)
     try:
         turn = await VllmHttpBackend(str(server.make_url(""))).generate(
-            prompt_ids=[1], sampling_params={}, num_token_samples=2
+            prompt_ids=[1], sampling_params={}, num_auxiliary_token_samples=2
         )
     finally:
         await server.close()
     assert seen["sampling_params"]["logprobs"] == 2 and seen["sampling_params"]["flat_logprobs"] is True
-    assert turn.output_samples.ids == [[9, 9], [6, 2]]
+    assert turn.output_auxiliary_token_samples.ids == [[9, 9], [6, 2]]
     assert turn.output_log_probs == [-0.1, -0.1]
 
 
@@ -57,7 +57,7 @@ async def test_vllm_http_backend_rejects_unpatched_server():
     try:
         with pytest.raises(RuntimeError, match="did not return 2 token samples"):
             await VllmHttpBackend(str(server.make_url(""))).generate(
-                prompt_ids=[1], sampling_params={}, num_token_samples=2
+                prompt_ids=[1], sampling_params={}, num_auxiliary_token_samples=2
             )
     finally:
         await server.close()

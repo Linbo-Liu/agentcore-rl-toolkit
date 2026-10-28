@@ -1,4 +1,4 @@
-"""Train with score function centering when the agent loop sets ``num_token_samples``."""
+"""Train with score function centering when the agent loop sets ``num_auxiliary_token_samples``."""
 
 from __future__ import annotations
 
@@ -14,14 +14,14 @@ from .base import TrainerMixinBase, agentcore_agent_loop_entries
 def _sfc_settings(config) -> tuple[int, float]:
     settings = set()
     for entry in agentcore_agent_loop_entries(config):
-        k, beta = entry.get("num_token_samples", 0), entry.get("sfc_kl_beta", 0.0)
+        k, beta = entry.get("num_auxiliary_token_samples", 0), entry.get("sfc_kl_beta", 0.0)
         if type(k) is not int or k < 0:  # noqa: E721 - reject bool
-            raise ValueError(f"num_token_samples must be a non-negative integer, got {k!r}")
+            raise ValueError(f"num_auxiliary_token_samples must be a non-negative integer, got {k!r}")
         if isinstance(beta, bool) or not isinstance(beta, int | float) or beta < 0:
             raise ValueError(f"sfc_kl_beta must be a non-negative number, got {beta!r}")
         settings.add((k, float(beta)))
     if len(settings) > 1:
-        raise ValueError("AgentCore agent loops must agree on num_token_samples and sfc_kl_beta")
+        raise ValueError("AgentCore agent loops must agree on num_auxiliary_token_samples and sfc_kl_beta")
     return settings.pop() if settings else (0, 0.0)
 
 
@@ -50,22 +50,22 @@ def _validate(config, parameter_sync_step: int) -> None:
         "model.use_fused_kernels=false": not model.get("use_fused_kernels", False),
     }
     if failed := [name for name, ok in checks.items() if not ok]:
-        raise ValueError("num_token_samples (score centering) requires: " + "; ".join(failed))
+        raise ValueError("num_auxiliary_token_samples (score centering) requires: " + "; ".join(failed))
 
 
 class ScoreCenteringMixin(TrainerMixinBase):
     """Install ``score_centering_loss`` on the actor and feed it the trainer's step."""
 
     def init(self):
-        self._num_token_samples, self._sfc_kl_beta = _sfc_settings(self.config)
-        if self._num_token_samples:
+        self._num_auxiliary_token_samples, self._sfc_kl_beta = _sfc_settings(self.config)
+        if self._num_auxiliary_token_samples:
             _validate(self.config, self.parameter_sync_step)
             score_centering.install_padding_patch()
         super().init()
 
     def on_init_end(self):
         super().on_init_end()
-        if not self._num_token_samples:
+        if not self._num_auxiliary_token_samples:
             return
         actor_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.actor)
         self.actor_rollout_wg.set_loss_fn(partial(score_centering.score_centering_loss, config=actor_config))
