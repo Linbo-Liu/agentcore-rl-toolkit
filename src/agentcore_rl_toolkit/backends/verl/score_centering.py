@@ -133,6 +133,21 @@ def install() -> None:
         server.vLLMHttpServer.generate = _server_generate
 
 
+def sample_fields(token_samples, k: int, prompt_length: int, response_length: int) -> dict:
+    """The draws and their weight versions per logits row: response token ``r`` is row ``prompt_length - 1 + r``."""
+    import torch
+
+    seq_len = prompt_length + response_length
+    draws = torch.zeros((seq_len, k), dtype=torch.int32)
+    versions = torch.full((seq_len,), -1, dtype=torch.int64)
+    for offset, samples in token_samples:
+        start = prompt_length - 1 + offset
+        draws[start : start + len(samples)] = torch.as_tensor(np.asarray(samples.ids), dtype=torch.int32)
+        if samples.versions is not None:
+            versions[start : start + len(samples)] = torch.as_tensor(np.asarray(samples.versions), dtype=torch.int64)
+    return {SAMPLE_IDS_KEY: draws, SAMPLE_VERSIONS_KEY: versions}
+
+
 def _score_from_logits(student_logits, data) -> dict:
     import torch
     from verl.utils.ulysses import get_ulysses_sequence_parallel_world_size

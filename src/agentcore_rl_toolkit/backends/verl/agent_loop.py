@@ -21,9 +21,7 @@ import time
 import uuid
 from typing import Any
 
-import numpy as np
 import ray
-import torch
 from pydantic import PrivateAttr, ValidationError
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopBase,
@@ -38,7 +36,7 @@ from agentcore_rl_toolkit.rollout_session.errors import RolloutContractError
 from agentcore_rl_toolkit.rollout_session.factory import make_session
 
 from .gateway_host import GatewayHandle, get_or_start_gateway
-from .score_centering import SAMPLE_IDS_KEY, SAMPLE_VERSIONS_KEY
+from .score_centering import sample_fields
 
 logger = logging.getLogger(__name__)
 
@@ -59,18 +57,8 @@ class _TokenSamplesOutput(AgentLoopOutput):
 
     def as_dict(self) -> dict[str, Any]:
         output = super().as_dict()
-        prompt_length = output["prompts"].size(0)
-        seq_len = prompt_length + output["responses"].size(0)
-        draws = torch.zeros((seq_len, self._num_token_samples), dtype=torch.int32)
-        versions = torch.full((seq_len,), -1, dtype=torch.int64)
-        for offset, samples in self._token_samples:
-            start = prompt_length - 1 + offset
-            end = start + len(samples)
-            draws[start:end] = torch.as_tensor(np.asarray(samples.ids), dtype=torch.int32)
-            if samples.versions is not None:
-                versions[start:end] = torch.as_tensor(np.asarray(samples.versions), dtype=torch.int64)
-        output[SAMPLE_IDS_KEY] = draws
-        output[SAMPLE_VERSIONS_KEY] = versions
+        prompt_length, response_length = output["prompts"].size(0), output["responses"].size(0)
+        output.update(sample_fields(self._token_samples, self._num_token_samples, prompt_length, response_length))
         return output
 
 
@@ -401,10 +389,8 @@ class AgentCoreAgentLoop(AgentLoopBase):
 
         token_samples = [(len(prompt_overflow) + offset, samples) for offset, samples in record.token_samples]
         if self.num_token_samples:
-            covered = np.zeros(len(response_mask), dtype=bool)
-            for offset, samples in token_samples:
-                covered[offset : offset + len(samples)] = True
-            if (np.asarray(response_mask, dtype=bool) & ~covered).any():
+            covered = {offset + i for offset, samples in token_samples for i in range(len(samples))}
+            if any(trained and i not in covered for i, trained in enumerate(response_mask)):
                 raise RuntimeError("trained tokens without sampler draws; is AGENTCORE_VLLM_TOKEN_SAMPLES=1 set?")
 
         output = (_TokenSamplesOutput if self.num_token_samples else AgentLoopOutput)(
