@@ -300,7 +300,8 @@ registers as a `vllm.general_plugins` entry point. See
 [`score_centering.py`](score_centering.py) for the loss and its references. The trainer checks the required settings at startup,
 including `algorithm.rollout_correction.rollout_is=null` and one optimizer step
 per local update. Separate-async training needs `cupy` for the NCCL checkpoint
-engine.
+engine. [`examples/math_agent/fsdp_fft_separate_async_sfc.sh`](examples/math_agent/fsdp_fft_separate_async_sfc.sh)
+is a separate-async recipe with stale rollouts.
 
 ## Troubleshooting
 
