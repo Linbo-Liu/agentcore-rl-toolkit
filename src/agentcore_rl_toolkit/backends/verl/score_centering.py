@@ -133,6 +133,17 @@ def install() -> None:
         server.vLLMHttpServer.generate = _server_generate
 
 
+def sfc_settings(config) -> tuple[int, float]:
+    """``(num_auxiliary_token_samples, kl_beta)`` from the trainer config's ``score_centering`` node."""
+    node = config.get("score_centering") or {}
+    k, beta = node.get("num_auxiliary_token_samples", 0), node.get("kl_beta", 0.0)
+    if type(k) is not int or k < 0:  # noqa: E721 - reject bool
+        raise ValueError(f"score_centering.num_auxiliary_token_samples must be a non-negative integer, got {k!r}")
+    if isinstance(beta, bool) or not isinstance(beta, int | float) or beta < 0:
+        raise ValueError(f"score_centering.kl_beta must be a non-negative number, got {beta!r}")
+    return k, float(beta)
+
+
 def sample_fields(auxiliary_token_samples, k: int, prompt_length: int, response_length: int) -> dict:
     """The draws and their weight versions per logits row: response token ``r`` is row ``prompt_length - 1 + r``."""
     import torch

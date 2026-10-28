@@ -36,7 +36,7 @@ from agentcore_rl_toolkit.rollout_session.errors import RolloutContractError
 from agentcore_rl_toolkit.rollout_session.factory import make_session
 
 from .gateway_host import GatewayHandle, get_or_start_gateway
-from .score_centering import sample_fields
+from .score_centering import sample_fields, sfc_settings
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,6 @@ class AgentCoreAgentLoop(AgentLoopBase):
         reward_extra_info_defaults: dict | None = None,
         # {name: threshold} -> emit reward_extra_info[name] = 1.0 if reward >= threshold.
         reward_thresholds: dict | None = None,
-        num_auxiliary_token_samples: int = 0,  # > 0 enables score centering (score_centering.py)
         **kwargs,  # swallows the YAML entry's `name`, verl's `tools`, and future kwargs
     ):
         super().__init__(trainer_config, server_manager, tokenizer, processor, dataset_cls, data_config, **kwargs)
@@ -137,11 +136,8 @@ class AgentCoreAgentLoop(AgentLoopBase):
             for value in (rollout_concurrency, tps_limit)
         ):
             raise ValueError("rollout_concurrency and tps_limit must be positive integers")
-        if type(num_auxiliary_token_samples) is not int or num_auxiliary_token_samples < 0:  # noqa: E721 - reject bool
-            raise ValueError(
-                f"num_auxiliary_token_samples must be a non-negative integer, got {num_auxiliary_token_samples!r}"
-            )
-        self.num_auxiliary_token_samples = num_auxiliary_token_samples
+        # > 0 enables score centering (score_centering.py), set in the trainer config.
+        self.num_auxiliary_token_samples, _ = sfc_settings(self.config)
         # Kept as config, not inlined, so a validated trainer-side mode can land
         # without a signature change. Reward semantics: see the README.
         self.reward_mode = reward_mode

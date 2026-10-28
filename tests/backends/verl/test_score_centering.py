@@ -10,7 +10,7 @@ from agentcore_rl_toolkit.backends.verl import score_centering as sc
 from agentcore_rl_toolkit.backends.verl.agent_loop import _TokenSamplesOutput
 from agentcore_rl_toolkit.rollout_gateway.sampling_backends.vllm_token_samples import sample_rows
 
-from .conftest import FakeLLMServerClient
+from .conftest import FakeLLMServerClient, make_trainer_config
 from .test_agent_loop import _make_loop, _wire_result, mock_http_client  # noqa: F401 - autouse fixture
 
 
@@ -82,7 +82,7 @@ def _sampled_turn(token_ids, k=2, version=3):
 @pytest.mark.asyncio
 async def test_agent_loop_aligns_draws_to_logits_rows_across_turns():
     llm = FakeLLMServerClient([_sampled_turn([101, 102], version=3), _sampled_turn([101, 102], version=4)])
-    loop = _make_loop(llm, num_auxiliary_token_samples=2)
+    loop = _make_loop(llm, trainer_config=make_trainer_config(score_centering={"num_auxiliary_token_samples": 2}))
     _wire_result(loop, {"reward": 1.0}, drive_turns=2)
 
     (out,) = await loop.run({"temperature": 1.0}, raw_prompt=[{"role": "user", "content": "hi"}], payload={})
@@ -106,7 +106,9 @@ async def test_agent_loop_aligns_draws_to_logits_rows_across_turns():
 
 @pytest.mark.asyncio
 async def test_agent_loop_requires_draws_for_trained_tokens():
-    loop = _make_loop(FakeLLMServerClient(), num_auxiliary_token_samples=2)
+    loop = _make_loop(
+        FakeLLMServerClient(), trainer_config=make_trainer_config(score_centering={"num_auxiliary_token_samples": 2})
+    )
     _wire_result(loop, {"reward": 1.0})
     with pytest.raises(RuntimeError, match="trained tokens without sampler draws"):
         await loop.run({}, raw_prompt=[{"role": "user", "content": "hi"}], payload={})

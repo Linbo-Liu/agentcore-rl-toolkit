@@ -291,10 +291,10 @@ materialized rollout sessions in each actor update, summed over a step's updates
 
 ## Score function centering
 
-Set `num_auxiliary_token_samples: K` in the agent-loop YAML and export
+Pass `+score_centering.num_auxiliary_token_samples=K` and export
 `AGENTCORE_VLLM_TOKEN_SAMPLES=1` to replace the policy loss with a ratio-free,
 score-centered REINFORCE plus a sampler-learner KL weighted by token age
-(`sfc_kl_beta`, β₀). vLLM draws `K` tokens per generated token from the sampling
+(`+score_centering.kl_beta=β₀`). vLLM draws `K` tokens per generated token from the sampling
 distribution through the gateway's `vllm_token_samples` plugin, which this package
 registers as a `vllm.general_plugins` entry point. See
 [`score_centering.py`](score_centering.py) for the loss and its references. The trainer checks the required settings at startup,
