@@ -56,8 +56,8 @@ class TemplateStubTokenizer:
 
 
 def _parse(decoded: str, *, template: str = "qwen3_5", prompt: str = CHATML_PROMPT, tools=TOOLS) -> ParsedOutput:
-    r = HfTemplateRenderer(TemplateStubTokenizer(decoded, prompt))
-    r._template = RESPONSE_TEMPLATES[template]
+    # Ship the template on the tokenizer so the renderer adopts it (and its prefix) at construction.
+    r = HfTemplateRenderer(TemplateStubTokenizer(decoded, prompt, response_template=RESPONSE_TEMPLATES[template]))
     return r.parse([1], tools_schema=tools)
 
 

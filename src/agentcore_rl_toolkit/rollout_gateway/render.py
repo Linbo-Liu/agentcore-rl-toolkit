@@ -158,7 +158,6 @@ class HfTemplateRenderer:
         self.tool_parser: ToolParserFn | None = tool_parser
         self._schema: dict | None = None
         self._template: dict | None = None
-        self._parse_prefix: str | None = None
         # Render-side template repair, independent of the parse path: some templates do
         # not render what their model generates, which breaks prefix reuse on replay.
         # Held here and passed per-call rather than assigned onto the tokenizer, so a
@@ -202,6 +201,9 @@ class HfTemplateRenderer:
             backend.encode_special_tokens = (
                 tokenizer.split_special_tokens if split_special_tokens is None else split_special_tokens
             )
+        # Every prompt ends with the same generation-prompt tail (e.g. Qwen3.5's open <think>);
+        # parse_response needs it as prefix= to parse output that starts inside that region.
+        self._parse_prefix = self._render_text([{"role": "user", "content": "."}]) if self._template else ""
 
     def _render_text(self, messages, *, tools=None, add_generation_prompt=True) -> str:
         return self.tokenizer.apply_chat_template(
@@ -365,21 +367,6 @@ class HfTemplateRenderer:
             ill_formed=ill_formed,
         )
 
-    def _generation_prefix(self) -> str:
-        """The prompt tail the template prefills before generation (e.g. an open ``<think>``).
-
-        ``parse_response`` truncates its ``prefix`` past the template's last start anchor,
-        so a one-message conversation rendered with the generation prompt carries the
-        same prefill as every real prompt from this renderer.
-        """
-        if self._parse_prefix is None:
-            try:
-                self._parse_prefix = self._render_text([{"role": "user", "content": "."}])
-            except Exception as e:
-                logger.warning("could not render the generation prompt for parsing (%s); using no prefix", e)
-                self._parse_prefix = ""
-        return self._parse_prefix
-
     def _parse_with_schema(self, raw_output: str, tools_schema: list[dict] | None) -> ParsedOutput:
         # Parsing never filters by tool name — a hallucinated tool flows through for
         # the agent framework to reject. Legacy schemas never see the tools schema;
@@ -388,7 +375,7 @@ class HfTemplateRenderer:
         # internally (parsing is text-level); decoding ourselves keeps a single
         # decode with our flags on every path, including the ill_formed fallback.
         if self._template is not None:
-            kwargs: dict[str, Any] = {"schema": self._template, "prefix": self._generation_prefix()}
+            kwargs: dict[str, Any] = {"schema": self._template, "prefix": self._parse_prefix}
             if tools_schema and SUPPORTS_PARSE_RESPONSE_TOOLS:
                 kwargs["tools"] = tools_schema
         else:
