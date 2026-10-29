@@ -14,10 +14,10 @@ HF rendering behind the :class:`Renderer` protocol:
   the whole output is parsed in one pass via ``tokenizer.parse_response`` — reasoning,
   text, and tool calls together, in the model's actual format. On transformers >= 5.13
   this uses a new-style ``response_template`` (the tokenizer's own, else the vendored
-  one); older versions use the legacy response schema. Otherwise it falls back to two stages — a reasoning parser then a
-  tool parser — each independently overridable via ``reasoning_parser`` /
-  ``tool_parser`` and each defaulting to the dependency-free implementation
-  (``</think>`` split / ``<tool_call><function=...>`` regex). Passing either stage
+  one); older versions use the legacy response schema. Otherwise it falls back to two
+  stages — a reasoning parser then a tool parser — each independently overridable via
+  ``reasoning_parser`` / ``tool_parser`` and each defaulting to the dependency-free
+  implementation (``</think>`` split / ``<tool_call><function=...>`` regex). Passing either stage
   parser disables schema detection: explicit injection (e.g. a trainer supplying its
   engine's detectors) always wins. Tool-bearing requests with no matched schema and no
   injected ``tool_parser`` are rejected rather than guessed at. Needs only
@@ -177,11 +177,13 @@ class HfTemplateRenderer:
         if reasoning_parser is None and tool_parser is None:
             # tokenizer.parse_response is guaranteed by the transformers>=5.0 floor
             # (the [gateway] extra); no availability guard needed.
-            native = getattr(tokenizer, "response_template", None) if SUPPORTS_RESPONSE_TEMPLATE else None
-            if isinstance(native, dict):
-                self._template = native
-            elif schema_name is not None and SUPPORTS_RESPONSE_TEMPLATE:
-                self._template = RESPONSE_TEMPLATES[schema_name]
+            if SUPPORTS_RESPONSE_TEMPLATE:
+                # Prefer the template the model repo ships, else the vendored one.
+                native = getattr(tokenizer, "response_template", None)
+                if isinstance(native, dict):
+                    self._template = native
+                elif schema_name is not None:
+                    self._template = RESPONSE_TEMPLATES[schema_name]
             elif schema_name is not None:
                 self._schema = RESPONSE_SCHEMAS[schema_name]
         # Pin the Rust backend's ``encode_special_tokens`` once, at construction.
@@ -339,10 +341,8 @@ class HfTemplateRenderer:
         tools_schema: list[dict] | None = None,
     ) -> ParsedOutput:
         raw_output = self.tokenizer.decode(output_ids, skip_special_tokens=False) if output_ids else ""
-        if self._template is not None:
-            return self._parse_with_template(raw_output, tools_schema)
-        if self._schema is not None:
-            return self._parse_with_schema(raw_output)
+        if self._template is not None or self._schema is not None:
+            return self._parse_with_schema(raw_output, tools_schema)
         if tools_schema and self.tool_parser is None:
             raise ValueError(
                 f"tools offered but the chat template of "
@@ -380,34 +380,24 @@ class HfTemplateRenderer:
                 self._parse_prefix = ""
         return self._parse_prefix
 
-    def _parse_with_template(self, raw_output: str, tools_schema: list[dict] | None) -> ParsedOutput:
-        # With tools, transformers >= 5.15 types each argument from its tool's JSON
-        # schema; a tool name outside the schema still parses, for the agent to reject.
-        tools = {"tools": tools_schema} if tools_schema and SUPPORTS_PARSE_RESPONSE_TOOLS else {}
-        try:
-            parsed = self.tokenizer.parse_response(
-                raw_output, schema=self._template, prefix=self._generation_prefix(), **tools
-            )
-        except Exception as e:
-            logger.warning("response-template parse failed (%s); degrading to raw text", e)
-            parsed = None
-        return self._from_parsed(parsed, raw_output)
-
-    def _parse_with_schema(self, raw_output: str) -> ParsedOutput:
-        # The tools schema is deliberately not passed: response schemas describe the
-        # model's output format, not the offered tools, so parsing never filters by
-        # tool name — a hallucinated tool flows through for the agent framework to
-        # reject. parse_response also accepts token ids, but only to decode them
+    def _parse_with_schema(self, raw_output: str, tools_schema: list[dict] | None) -> ParsedOutput:
+        # Parsing never filters by tool name — a hallucinated tool flows through for
+        # the agent framework to reject. Legacy schemas never see the tools schema;
+        # response templates on transformers >= 5.15 use it only to type each
+        # argument. parse_response also accepts token ids, but only to decode them
         # internally (parsing is text-level); decoding ourselves keeps a single
         # decode with our flags on every path, including the ill_formed fallback.
+        if self._template is not None:
+            kwargs: dict[str, Any] = {"schema": self._template, "prefix": self._generation_prefix()}
+            if tools_schema and SUPPORTS_PARSE_RESPONSE_TOOLS:
+                kwargs["tools"] = tools_schema
+        else:
+            kwargs = {"schema": self._schema}
         try:
-            parsed = self.tokenizer.parse_response(raw_output, schema=self._schema)
+            parsed = self.tokenizer.parse_response(raw_output, **kwargs)
         except Exception as e:
             logger.warning("response-schema parse failed (%s); degrading to raw text", e)
             parsed = None
-        return self._from_parsed(parsed, raw_output)
-
-    def _from_parsed(self, parsed: Any, raw_output: str) -> ParsedOutput:
         if not isinstance(parsed, dict):
             # None = the schema's anchored regex did not match (e.g. output truncated
             # mid-tool-call). Degrade in place, flagged — never fail the turn.

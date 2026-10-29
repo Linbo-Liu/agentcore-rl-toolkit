@@ -13,7 +13,7 @@ from agentcore_rl_toolkit.rollout_gateway.render import HfTemplateRenderer, Pars
 from agentcore_rl_toolkit.rollout_gateway.response_schemas import _TEMPLATE_HASHES, RESPONSE_SCHEMAS
 
 recursive_parse = pytest.importorskip(
-    "transformers.utils.chat_parsing_utils", reason="transformers >= 5.16 removed the legacy schema parser"
+    "transformers.utils.chat_parsing_utils", reason="transformers >= 5.15 removed the legacy schema parser"
 ).recursive_parse
 
 TOOLS = [{"type": "function", "function": {"name": "calculator", "parameters": {}}}]

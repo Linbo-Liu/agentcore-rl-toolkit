@@ -180,7 +180,7 @@ package exports are loaded on first access. The gateway lives behind extras:
   Nemotron-3; vendored from huggingface/trl, see NOTICE). On transformers >= 5.13 it
   uses a new-style `response_template` (the tokenizer's own, else the vendored one) with
   `prefix=` set to the generation prompt and, on >= 5.15, `tools=` to type arguments;
-  older versions use the legacy schemas (transformers 5.16 removed their engine). A
+  older versions use the legacy schemas (transformers 5.15 removed their engine). A
   parse failure degrades to raw text with `ill_formed=True`, never an exception.
   Unrecognized templates fall back to a `</think>` split for tool-free parsing, but
   tool-bearing requests are **rejected** (there is no implicit tool parser — the

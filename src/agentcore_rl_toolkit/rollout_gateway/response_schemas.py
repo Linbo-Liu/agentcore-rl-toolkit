@@ -15,7 +15,7 @@ A schema is pure data: the parsing engine is transformers'
 so a literal ``<tool_call>`` inside a think block never corrupts the split. Note for
 schema authors: transformers >= 5.13 replaces this legacy ``response_schema`` format
 with the region-based ``response_template`` format (and a ``prefix=`` argument), and
-transformers 5.16 removes the legacy engine.
+transformers 5.15 removes the legacy engine.
 
 ``RESPONSE_TEMPLATES`` holds the new-style templates, vendored from the same TRL file
 at commit ``6d6901c5``. ``HfTemplateRenderer`` uses a tokenizer's own
@@ -194,9 +194,6 @@ RESPONSE_SCHEMAS: dict[str, dict] = {
 
 # --- Response templates (vendored from TRL, new-style) ------------------------------
 
-# Qwen3.5, GLM-4-MoE and Nemotron 3 render a string tool-call argument as raw text, so
-# "75001" and 75001 render the same. With parse_response(tools=...) the values stay
-# text and the tool's JSON schema types them; older versions guess with lenient JSON.
 _XML_INLINE_VALUE_PARSER = (
     {"name": "text"} if SUPPORTS_PARSE_RESPONSE_TOOLS else {"name": "json", "args": {"allow_non_json": True}}
 )
